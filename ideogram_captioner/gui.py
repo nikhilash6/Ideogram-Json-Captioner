@@ -768,8 +768,26 @@ class CaptionEditorApp(tk.Tk):
     def _bind_text(self, widget: tk.Text, callback: callable) -> None:
         widget.bind("<<Modified>>", lambda event: self._on_text_modified(event, callback))
         widget.bind("<KeyPress-Return>", self.on_text_return_key)
+        widget.bind("<Tab>", self.focus_next_widget)
+        widget.bind("<Shift-Tab>", self.focus_previous_widget)
+        try:
+            widget.bind("<ISO_Left_Tab>", self.focus_previous_widget)
+        except tk.TclError:
+            pass
         widget.bind("<Control-KeyPress-Down>", self.next_image_always)
         widget.bind("<Control-KeyPress-Up>", self.previous_image_always)
+
+    def focus_next_widget(self, event: tk.Event) -> str:
+        next_widget = event.widget.tk_focusNext()
+        if next_widget is not None:
+            next_widget.focus_set()
+        return "break"
+
+    def focus_previous_widget(self, event: tk.Event) -> str:
+        previous_widget = event.widget.tk_focusPrev()
+        if previous_widget is not None:
+            previous_widget.focus_set()
+        return "break"
 
     def bind_child_navigation_shortcuts(self, widget: tk.Widget) -> None:
         widget.bind("<Control-KeyPress-Down>", self.next_image_always)

@@ -64,6 +64,7 @@ disabled to prevent accidental overwrite.
 
 - `Enter`: save and move to the next image.
 - `Shift+Enter`: insert a newline in a text field.
+- `Tab` / `Shift+Tab`: move forward or backward between fields.
 - Arrow keys: navigate images when focus is not inside an input.
 - `Ctrl+Up` / `Ctrl+Down`: navigate images even when an input has focus.
 - `Ctrl+S`: save.
