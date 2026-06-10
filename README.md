@@ -1,11 +1,11 @@
-# Ideogram Captioner
+# Ideogram-JSON-Captioner
 
 A local desktop editor for image-caption pairs in Ideogram 4 structured JSON
 format. It is designed for reviewing image datasets, fixing generated captions,
 and drawing or adjusting object/text bounding boxes without leaving the folder
 you are working in.
 
-The app runs locally. It does not upload images or captions anywhere.
+The app runs locally. It does not upload images or captions anywhere.  It does not yet support automatically captioning images.
 
 ## Features
 
@@ -13,17 +13,18 @@ The app runs locally. It does not upload images or captions anywhere.
 - Edit Ideogram JSON fields for high-level description, style, background,
   elements, rendered text, bounding boxes, and color palettes.
 - Draw, move, resize, remove, and numerically edit bounding boxes.
-- Resize selected boxes from corners or edges.
-- Color-code object boxes on the canvas and in the element list.
-- Click repeatedly through overlapping boxes at the same point.
+- Color-coded object boxes on the canvas and in the element list.
 - Maintain a separate editable original caption file, such as `.txt` or
   `.original`, while saving structured JSON separately.
 - Copy the current image into an `edit` subfolder for later Photoshop work.
 - Sort the image list by name, modified date, missing structured captions, or
   missing original captions.
 - Autosave edits and save manually with the Save button.
+- It does not yet support running a model to caption or recaption automatically.  This may be added later.
 
 ## Install
+
+The easiest way to install and use it Ideogram-JSON-Captioner in Windows is to grab the .exe from the releases section.  Alternatively,
 
 ```powershell
 python -m venv .venv
@@ -81,20 +82,6 @@ The app writes compact UTF-8 JSON using the Ideogram 4 caption structure:
 
 Reference: <https://github.com/ideogram-oss/ideogram4/blob/main/docs/prompting.md>
 
-## Tests
-
-```powershell
-python -m unittest discover -s tests
-```
-
-## Packaging
-
-For a single Windows executable, install PyInstaller and build the entry point:
-
-```powershell
-pip install pyinstaller
-pyinstaller --noconsole --name IdeogramCaptioner run_captioner.py
-```
 
 ## License
 
