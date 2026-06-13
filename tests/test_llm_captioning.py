@@ -308,6 +308,8 @@ class LlmCaptioningTests(unittest.TestCase):
         self.assertIn("--mmproj", command)
         self.assertIn("--port 8111", command)
         self.assertIn("--alias caption-model", command)
+        self.assertIn("-b 2048", command)
+        self.assertIn("-ub 2048", command)
         self.assertIn("--reasoning off", command)
 
     def test_can_limit_llama_reasoning_budget_when_thinking_is_enabled(self):
@@ -375,7 +377,7 @@ class LlmCaptioningTests(unittest.TestCase):
         self.assertEqual(len(client.completions.requests), 1)
         self.assertEqual(client.completions.requests[0]["messages"][1]["content"], "Describe this.")
 
-    def test_vision_chat_retries_image_order_but_not_no_think(self):
+    def test_vision_chat_uses_image_first_then_text_first_fallback(self):
         client = FakeClient(
             [
                 FakeResponse("", finish_reason="length", model="vision-model"),
@@ -400,8 +402,10 @@ class LlmCaptioningTests(unittest.TestCase):
         self.assertEqual(len(client.completions.requests), 2)
         first_user_content = client.completions.requests[0]["messages"][1]["content"]
         retry_user_content = client.completions.requests[1]["messages"][1]["content"]
-        self.assertEqual(first_user_content[0]["text"], "Describe this image.")
-        self.assertEqual(retry_user_content[1]["text"], "Describe this image.")
+        self.assertEqual(first_user_content[0]["type"], "image_url")
+        self.assertEqual(first_user_content[1]["text"], "Describe this image.")
+        self.assertEqual(retry_user_content[0]["text"], "Describe this image.")
+        self.assertEqual(retry_user_content[1]["type"], "image_url")
 
     def test_vision_chat_warns_when_thinking_returns_no_visible_output(self):
         client = FakeClient(

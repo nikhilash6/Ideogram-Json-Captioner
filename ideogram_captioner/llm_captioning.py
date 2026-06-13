@@ -333,8 +333,8 @@ class CaptioningSettings:
     llama_server_path: str = ""
     llama_context: int = 32768
     llama_gpu_layers: int = 999
-    llama_batch: int = 512
-    llama_ubatch: int = 256
+    llama_batch: int = 2048
+    llama_ubatch: int = 2048
     llama_threads: int = 0
     llama_extra_args: str = "-fa on"
     llama_reasoning_budget: int = 2048
@@ -855,6 +855,17 @@ def empty_response_hint(settings: CaptioningSettings) -> str:
     )
 
 
+def request_failure_message(kind: str, exc: Exception) -> str:
+    message = str(exc)
+    hint = ""
+    if "connection error" in message.lower():
+        hint = (
+            " The local server may have crashed or closed the connection during generation. "
+            "Check models/server_logs for llama-server assertions or out-of-memory errors."
+        )
+    return f"{kind} model request failed: {exc}.{hint}"
+
+
 def chat_text(
     settings: CaptioningSettings,
     model: str,
@@ -877,7 +888,7 @@ def chat_text(
             ],
         )
     except Exception as exc:
-        raise AutoCaptionError(f"Text model request failed: {exc}") from exc
+        raise AutoCaptionError(request_failure_message("Text", exc)) from exc
     choice = response.choices[0] if response.choices else None
     content = choice.message.content if choice is not None else None
     visible_content = strip_thinking_output(content) if content else ""
@@ -919,11 +930,11 @@ def chat_vision(
         )
 
     errors: list[str] = []
-    for image_first in (False, True):
+    for image_first in (True, False):
         try:
             response = request(image_first=image_first)
         except Exception as exc:
-            raise AutoCaptionError(f"Vision model request failed: {exc}") from exc
+            raise AutoCaptionError(request_failure_message("Vision", exc)) from exc
         choice = response.choices[0] if response.choices else None
         content = choice.message.content if choice is not None else None
         visible_content = strip_thinking_output(content) if content else ""

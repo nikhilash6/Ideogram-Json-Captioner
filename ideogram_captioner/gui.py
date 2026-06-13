@@ -1352,6 +1352,14 @@ class CaptionEditorApp(tk.Tk):
 
         self.image_list.bind("<<ListboxSelect>>", self.on_image_list_select)
         self.image_list.bind("<ButtonPress-1>", self.remember_image_list_click, add="+")
+        self.image_list.bind("<Left>", self.block_image_list_horizontal_scroll)
+        self.image_list.bind("<Right>", self.block_image_list_horizontal_scroll)
+        self.image_list.bind("<Shift-MouseWheel>", self.block_image_list_horizontal_scroll)
+        for sequence in ("<Button-6>", "<Button-7>"):
+            try:
+                self.image_list.bind(sequence, self.block_image_list_horizontal_scroll)
+            except tk.TclError:
+                pass
         self.image_list.bind("<Control-a>", self.select_all_images)
         self.image_list.bind("<Control-A>", self.select_all_images)
         self.elements_tree.bind("<<TreeviewSelect>>", self.on_element_tree_select)
@@ -1615,12 +1623,29 @@ class CaptionEditorApp(tk.Tk):
         if not self.images:
             self.clear_loaded_image(f"No images match {self.image_sort_var.get()}.")
             return
-        self.load_image_at(0)
+        self.load_image_at(0, reset_editor_scroll=True)
 
-    def populate_image_list(self) -> None:
+    def image_list_vertical_scroll(self) -> tuple[float, float] | None:
+        try:
+            top, bottom = self.image_list.yview()
+        except tk.TclError:
+            return None
+        return float(top), float(bottom)
+
+    def restore_image_list_vertical_scroll(self, scroll: tuple[float, float] | None) -> None:
+        if scroll is None:
+            return
+        try:
+            self.image_list.yview_moveto(scroll[0])
+        except tk.TclError:
+            pass
+
+    def populate_image_list(self, preserve_scroll: bool = False) -> None:
+        scroll = self.image_list_vertical_scroll() if preserve_scroll else None
         self.loading_list = True
         self.image_list.delete(0, "end")
         if self.store is None:
+            self.restore_image_list_vertical_scroll(scroll)
             self.loading_list = False
             return
         for index, image_path in enumerate(self.images, start=1):
@@ -1629,7 +1654,19 @@ class CaptionEditorApp(tk.Tk):
             else:
                 marker = " " if self.store.caption_path(image_path).exists() else "+"
             self.image_list.insert("end", f"{index:04d} {marker} {image_path.name}")
+        self.reset_image_list_horizontal_scroll()
+        self.restore_image_list_vertical_scroll(scroll)
         self.loading_list = False
+
+    def reset_image_list_horizontal_scroll(self) -> None:
+        try:
+            self.image_list.xview_moveto(0.0)
+        except tk.TclError:
+            pass
+
+    def block_image_list_horizontal_scroll(self, _event: tk.Event | None = None) -> str:
+        self.reset_image_list_horizontal_scroll()
+        return "break"
 
     def on_image_list_select(self, _event: tk.Event) -> None:
         if self.loading_list:
@@ -1739,7 +1776,7 @@ class CaptionEditorApp(tk.Tk):
                 except tk.TclError:
                     active = selection[0]
                 index = active if active in selection else selection[0]
-            self.load_image_at(index, preserve_selection=True)
+            self.load_image_at(index, preserve_selection=True, reveal_selection=False)
 
     def select_all_images(self, _event: tk.Event | None = None) -> str:
         if not self.images:
@@ -1767,7 +1804,15 @@ class CaptionEditorApp(tk.Tk):
         else:
             self.clear_loaded_image(f"No images match {self.image_sort_var.get()}.")
 
-    def load_image_at(self, index: int, preserve_selection: bool = False, skip_save: bool = False, force_reload: bool = False) -> None:
+    def load_image_at(
+        self,
+        index: int,
+        preserve_selection: bool = False,
+        skip_save: bool = False,
+        force_reload: bool = False,
+        reveal_selection: bool = True,
+        reset_editor_scroll: bool = False,
+    ) -> None:
         if index < 0 or index >= len(self.images):
             return
         if index == self.current_index and not force_reload:
@@ -1807,8 +1852,12 @@ class CaptionEditorApp(tk.Tk):
         self.selected_element_index = 0 if elements else None
         self.load_original_text(image_path)
         self.populate_form()
-        self.populate_image_selection(selected_paths=selected_paths if preserve_selection else None)
-        self.editor.scroll_to_top()
+        self.populate_image_selection(
+            selected_paths=selected_paths if preserve_selection else None,
+            reveal_current=reveal_selection,
+        )
+        if reset_editor_scroll:
+            self.editor.scroll_to_top()
         self.render_image()
         if message:
             self.status_var.set(message)
@@ -1819,6 +1868,7 @@ class CaptionEditorApp(tk.Tk):
         self,
         selected_indices: tuple[int, ...] | None = None,
         selected_paths: list[Path] | tuple[Path, ...] | None = None,
+        reveal_current: bool = True,
     ) -> None:
         if selected_paths is not None:
             selected_indices = self.image_indices_for_paths(selected_paths)
@@ -1832,15 +1882,18 @@ class CaptionEditorApp(tk.Tk):
                     selected_any = True
             if self.current_index >= 0:
                 self.image_list.activate(self.current_index)
-                self.image_list.see(self.current_index)
+                if reveal_current:
+                    self.image_list.see(self.current_index)
         if not selected_any and self.current_index >= 0:
             self.image_list.selection_set(self.current_index)
             self.image_list.activate(self.current_index)
-            self.image_list.see(self.current_index)
+            if reveal_current:
+                self.image_list.see(self.current_index)
             self.image_selection_anchor_path = self.images[self.current_index]
         anchor_index = self.current_image_selection_anchor_index()
         if anchor_index is not None and hasattr(self.image_list, "selection_anchor"):
             self.image_list.selection_anchor(anchor_index)
+        self.reset_image_list_horizontal_scroll()
         self.loading_list = False
 
     def populate_form(self) -> None:
@@ -2860,6 +2913,7 @@ class CaptionEditorApp(tk.Tk):
         if self.store is None or self.current_index < 0 or self.current_index >= len(self.images):
             return
         selected_paths = self.current_image_selection_paths()
+        list_scroll = self.image_list_vertical_scroll()
         self.sync_caption_from_form()
         image_path = self.images[self.current_index]
         saved_names: list[str] = []
@@ -2873,8 +2927,9 @@ class CaptionEditorApp(tk.Tk):
             messagebox.showerror("Save failed", str(exc))
             return
         self.dirty = False
-        self.populate_image_list()
-        self.populate_image_selection(selected_paths=selected_paths)
+        self.populate_image_list(preserve_scroll=True)
+        self.populate_image_selection(selected_paths=selected_paths, reveal_current=False)
+        self.restore_image_list_vertical_scroll(list_scroll)
         self.status_var.set(f"Saved {', '.join(saved_names)} at {time.strftime('%H:%M:%S')}")
 
     def copy_current_image_to_edit(self) -> None:

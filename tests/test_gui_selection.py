@@ -10,6 +10,8 @@ class FakeListbox:
         self.activated: int | None = None
         self.seen: int | None = None
         self.anchor: int | None = None
+        self.xview: float | None = None
+        self.yview_top = 0.0
 
     def curselection(self) -> tuple[int, ...]:
         return tuple(sorted(self.selection))
@@ -37,6 +39,15 @@ class FakeListbox:
 
     def see(self, index: int) -> None:
         self.seen = int(index)
+
+    def xview_moveto(self, fraction: float) -> None:
+        self.xview = float(fraction)
+
+    def yview(self) -> tuple[float, float]:
+        return (self.yview_top, min(1.0, self.yview_top + 0.25))
+
+    def yview_moveto(self, fraction: float) -> None:
+        self.yview_top = float(fraction)
 
     def selection_anchor(self, index: int) -> None:
         self.anchor = int(index)
@@ -87,6 +98,33 @@ class GuiSelectionTests(unittest.TestCase):
         self.assertEqual(app.image_list.curselection(), (1,))
         self.assertEqual(app.image_list.activated, 1)
         self.assertEqual(app.image_list.seen, 1)
+
+    def test_populate_image_selection_can_preserve_list_viewport(self) -> None:
+        images = [Path("a.png"), Path("b.png"), Path("c.png")]
+        app = self.make_app(images, (), 1)
+
+        app.populate_image_selection(reveal_current=False)
+
+        self.assertEqual(app.image_list.curselection(), (1,))
+        self.assertEqual(app.image_list.activated, 1)
+        self.assertIsNone(app.image_list.seen)
+        self.assertEqual(app.image_list.xview, 0.0)
+
+    def test_horizontal_image_list_scroll_is_blocked(self) -> None:
+        app = self.make_app([Path("a.png")], (), 0)
+
+        self.assertEqual(app.block_image_list_horizontal_scroll(), "break")
+        self.assertEqual(app.image_list.xview, 0.0)
+
+    def test_image_list_vertical_scroll_can_be_restored(self) -> None:
+        app = self.make_app([Path("a.png")], (), 0)
+        app.image_list.yview_top = 0.6
+        scroll = app.image_list_vertical_scroll()
+
+        app.image_list.yview_top = 0.0
+        app.restore_image_list_vertical_scroll(scroll)
+
+        self.assertEqual(app.image_list.yview_top, 0.6)
 
     def test_shift_click_selects_range_from_saved_anchor(self) -> None:
         images = [Path("a.png"), Path("b.png"), Path("c.png"), Path("d.png"), Path("e.png")]

@@ -27,6 +27,10 @@ captioner_model_profiles.json
 captioner_prompts/
 models/
 server_logs/
+standaloneCaptioningStuff/
+*.caption_failed.json
+*.caption
+*.original
 
 # Editor and OS files
 .idea/
