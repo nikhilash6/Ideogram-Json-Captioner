@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
+import os
+import queue
 import shutil
+import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -22,6 +28,35 @@ from .schema import (
     palette_to_text,
 )
 from .store import CaptionStore
+from .llm_captioning import (
+    AutoCaptionError,
+    CaptioningSettings,
+    ModelJsonError,
+    add_bboxes_to_caption,
+    build_llama_server_command,
+    default_models_dir,
+    default_prompts_path,
+    default_profiles_path,
+    ensure_model_assets,
+    find_llama_server,
+    format_server_command,
+    generate_json_from_image,
+    generate_json_from_text,
+    generate_plain_caption,
+    is_server_ready,
+    load_settings,
+    profile_seed_data,
+    profile_id_from_label,
+    profile_label_from_id,
+    profile_labels,
+    profiles_for_task,
+    runtime_config_for_task,
+    save_settings,
+    server_model_ids,
+    start_server_process,
+    stop_server_process,
+    write_default_prompts,
+)
 
 
 try:
@@ -69,6 +104,8 @@ IMAGE_SORT_MODIFIED_NEWEST = "Modified newest"
 IMAGE_SORT_MODIFIED_OLDEST = "Modified oldest"
 IMAGE_SORT_CAPTION_MISSING = "Caption missing first"
 IMAGE_SORT_ORIGINAL_MISSING = "Original missing first"
+IMAGE_SORT_BBOX_MISSING = "Missing bboxes only"
+IMAGE_SORT_FAILED = "Failed captions only"
 IMAGE_SORT_OPTIONS = (
     IMAGE_SORT_NAME_ASC,
     IMAGE_SORT_NAME_DESC,
@@ -76,7 +113,19 @@ IMAGE_SORT_OPTIONS = (
     IMAGE_SORT_MODIFIED_OLDEST,
     IMAGE_SORT_CAPTION_MISSING,
     IMAGE_SORT_ORIGINAL_MISSING,
+    IMAGE_SORT_BBOX_MISSING,
+    IMAGE_SORT_FAILED,
 )
+RUNTIME_LOCAL_LABEL = "Local llama.cpp (recommended)"
+RUNTIME_EXISTING_LABEL = "Connect to existing server"
+RUNTIME_CUSTOM_LABEL = "Custom start commands"
+RUNTIME_LABELS = (RUNTIME_LOCAL_LABEL, RUNTIME_EXISTING_LABEL, RUNTIME_CUSTOM_LABEL)
+RUNTIME_MODE_TO_LABEL = {
+    "local": RUNTIME_LOCAL_LABEL,
+    "existing": RUNTIME_EXISTING_LABEL,
+    "custom": RUNTIME_CUSTOM_LABEL,
+}
+RUNTIME_LABEL_TO_MODE = {label: mode for mode, label in RUNTIME_MODE_TO_LABEL.items()}
 
 
 def mix_hex_color(color: str, base: str, amount: float) -> str:
@@ -137,6 +186,497 @@ class ScrollFrame(ttk.Frame):
         self.canvas.yview_moveto(0.0)
 
 
+class CaptioningPreferencesDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, settings: CaptioningSettings) -> None:
+        super().__init__(parent)
+        self.title("Auto Captioning Preferences")
+        self.transient(parent)
+        self.result: CaptioningSettings | None = None
+
+        self.base_url_var = tk.StringVar(value=settings.base_url)
+        self.api_key_var = tk.StringVar(value=settings.api_key)
+        self.hf_token_var = tk.StringVar(value=settings.hf_token)
+        self.models_dir_var = tk.StringVar(value=settings.models_dir or str(default_models_dir()))
+
+        self.caption_profile_var = tk.StringVar(value=profile_label_from_id("caption", settings.caption_profile_id))
+        self.caption_model_var = tk.StringVar(value=settings.caption_model)
+        self.caption_hf_repo_var = tk.StringVar(value=settings.caption_hf_repo)
+        self.caption_model_file_var = tk.StringVar(value=settings.caption_model_filename)
+        self.caption_mmproj_file_var = tk.StringVar(value=settings.caption_mmproj_filename)
+        self.caption_local_model_path_var = tk.StringVar(value=settings.caption_local_model_path)
+        self.caption_local_mmproj_path_var = tk.StringVar(value=settings.caption_local_mmproj_path)
+
+        self.bbox_profile_var = tk.StringVar(value=profile_label_from_id("bbox", settings.bbox_profile_id))
+        self.bbox_model_var = tk.StringVar(value=settings.bbox_model)
+        self.bbox_hf_repo_var = tk.StringVar(value=settings.bbox_hf_repo)
+        self.bbox_model_file_var = tk.StringVar(value=settings.bbox_model_filename)
+        self.bbox_mmproj_file_var = tk.StringVar(value=settings.bbox_mmproj_filename)
+        self.bbox_local_model_path_var = tk.StringVar(value=settings.bbox_local_model_path)
+        self.bbox_local_mmproj_path_var = tk.StringVar(value=settings.bbox_local_mmproj_path)
+
+        self.add_bboxes_var = tk.BooleanVar(value=settings.add_bboxes_after_json)
+        self.overwrite_bboxes_var = tk.BooleanVar(value=settings.overwrite_bboxes)
+        self.filter_bbox_targets_var = tk.BooleanVar(value=settings.filter_bbox_targets)
+        self.creative_var = tk.BooleanVar(value=settings.creative_json)
+        self.disable_thinking_var = tk.BooleanVar(value=settings.disable_thinking)
+        self.vision_format_var = tk.StringVar(value=settings.vision_image_format)
+        self.max_caption_tokens_var = tk.StringVar(value=str(settings.max_tokens_caption))
+        self.max_json_tokens_var = tk.StringVar(value=str(settings.max_tokens_json))
+        self.max_bbox_tokens_var = tk.StringVar(value=str(settings.max_tokens_bboxes))
+        self.context_chars_var = tk.StringVar(value=str(settings.context_chars))
+        self.max_targets_var = tk.StringVar(value=str(settings.max_targets_per_call))
+
+        self.runtime_mode_var = tk.StringVar(value=RUNTIME_MODE_TO_LABEL.get(settings.server_start_mode, RUNTIME_LOCAL_LABEL))
+        self.auto_start_var = tk.BooleanVar(value=settings.auto_start_server)
+        default_llama_server = find_llama_server()
+        llama_server_path = settings.llama_server_path or (str(default_llama_server) if default_llama_server else "")
+        self.llama_server_path_var = tk.StringVar(value=llama_server_path)
+        self.llama_context_var = tk.StringVar(value=str(settings.llama_context))
+        self.llama_gpu_layers_var = tk.StringVar(value=str(settings.llama_gpu_layers))
+        self.llama_batch_var = tk.StringVar(value=str(settings.llama_batch))
+        self.llama_ubatch_var = tk.StringVar(value=str(settings.llama_ubatch))
+        self.llama_threads_var = tk.StringVar(value=str(settings.llama_threads))
+        self.llama_extra_args_var = tk.StringVar(value=settings.llama_extra_args)
+        self.llama_reasoning_budget_var = tk.StringVar(value=str(settings.llama_reasoning_budget))
+        self.caption_server_command_var = tk.StringVar(value=settings.caption_server_command)
+        self.bbox_server_command_var = tk.StringVar(value=settings.bbox_server_command)
+        self.server_timeout_var = tk.StringVar(value=str(settings.server_startup_timeout))
+        self.stop_server_var = tk.BooleanVar(value=settings.stop_server_after_job)
+        self.custom_profile_frames: dict[str, dict[str, ttk.Frame]] = {}
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.grab_set()
+        self.update_idletasks()
+        self.geometry(f"820x760+{parent.winfo_rootx() + 80}+{parent.winfo_rooty() + 50}")
+
+    def _build_ui(self) -> None:
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(self)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+        connection = ttk.Frame(notebook, padding=10)
+        models = ttk.Frame(notebook, padding=10)
+        pipeline = ttk.Frame(notebook, padding=10)
+        notebook.add(connection, text="Connection")
+        notebook.add(models, text="Models")
+        notebook.add(pipeline, text="Pipeline")
+
+        self._build_connection_tab(connection)
+        self._build_models_tab(models)
+        self._build_pipeline_tab(pipeline)
+
+        buttons = ttk.Frame(self, padding=(10, 0, 10, 10))
+        buttons.grid(row=1, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+        ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(buttons, text="Save", command=self._save, style="Accent.TButton").grid(row=0, column=2)
+
+    def _add_entry(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        show: str | None = None,
+    ) -> int:
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        entry = ttk.Entry(parent, textvariable=variable, show=show or "")
+        entry.grid(row=row, column=1, sticky="ew", pady=4)
+        return row + 1
+
+    def _build_connection_tab(self, parent: ttk.Frame) -> None:
+        row = 0
+        parent.columnconfigure(1, weight=1)
+
+        ttk.Label(parent, text="Runtime").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        runtime_combo = ttk.Combobox(parent, textvariable=self.runtime_mode_var, values=RUNTIME_LABELS, state="readonly")
+        runtime_combo.grid(row=row, column=1, sticky="ew", pady=4)
+        runtime_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_runtime_mode_changed())
+        row += 1
+
+        ttk.Checkbutton(parent, text="Start runtime automatically before jobs", variable=self.auto_start_var).grid(
+            row=row,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=4,
+        )
+        row += 1
+        ttk.Checkbutton(parent, text="Stop auto-started runtime after job", variable=self.stop_server_var).grid(
+            row=row,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=4,
+        )
+        row += 1
+        row = self._add_entry(parent, row, "OpenAI-compatible base URL", self.base_url_var)
+        row = self._add_entry(parent, row, "API key", self.api_key_var, show="*")
+        row = self._add_entry(parent, row, "Hugging Face token", self.hf_token_var, show="*")
+
+        ttk.Label(parent, text="Models folder").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(parent, textvariable=self.models_dir_var).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Button(parent, text="Browse", command=self._browse_models_dir).grid(row=row, column=2, padx=(6, 0), pady=4)
+        row += 1
+
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+
+        ttk.Label(parent, text="Local llama.cpp", style="Section.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+        ttk.Label(parent, text="llama-server.exe").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(parent, textvariable=self.llama_server_path_var).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Button(parent, text="Browse", command=self._browse_llama_server).grid(row=row, column=2, padx=(6, 0), pady=4)
+        row += 1
+        row = self._add_entry(parent, row, "Context size", self.llama_context_var)
+        row = self._add_entry(parent, row, "GPU layers", self.llama_gpu_layers_var)
+        row = self._add_entry(parent, row, "Batch size", self.llama_batch_var)
+        row = self._add_entry(parent, row, "Ubatch size", self.llama_ubatch_var)
+        row = self._add_entry(parent, row, "CPU threads (0 = auto)", self.llama_threads_var)
+        row = self._add_entry(parent, row, "Thinking token budget (-1 = unrestricted)", self.llama_reasoning_budget_var)
+        row = self._add_entry(parent, row, "Extra llama args", self.llama_extra_args_var)
+        row = self._add_entry(parent, row, "Startup timeout seconds", self.server_timeout_var)
+
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+        ttk.Label(parent, text="Custom start commands", style="Section.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+        row = self._add_entry(parent, row, "Caption server command", self.caption_server_command_var)
+        row = self._add_entry(parent, row, "BBox server command", self.bbox_server_command_var)
+
+        hint = (
+            "Server command placeholders: {model_path}, {mmproj_path}, {models_dir}, "
+            "{api_model}, {base_url}."
+        )
+        ttk.Label(parent, text=hint, wraplength=680).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        row += 1
+        ttk.Button(parent, text="Test Server", command=self._test_server).grid(row=row, column=0, sticky="w", pady=(12, 0))
+        self._on_runtime_mode_changed()
+
+    def _build_models_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(1, weight=1)
+        row = 0
+        ttk.Label(parent, text="Caption / JSON model", style="Section.TLabel").grid(
+            row=row,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 8),
+        )
+        row += 1
+        row = self._add_profile_controls(
+            parent,
+            row,
+            "caption",
+            self.caption_profile_var,
+            self.caption_model_var,
+            self.caption_hf_repo_var,
+            self.caption_model_file_var,
+            self.caption_mmproj_file_var,
+            self.caption_local_model_path_var,
+            self.caption_local_mmproj_path_var,
+        )
+
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=14)
+        row += 1
+        ttk.Label(parent, text="BBox VLM", style="Section.TLabel").grid(
+            row=row,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 8),
+        )
+        row += 1
+        row = self._add_profile_controls(
+            parent,
+            row,
+            "bbox",
+            self.bbox_profile_var,
+            self.bbox_model_var,
+            self.bbox_hf_repo_var,
+            self.bbox_model_file_var,
+            self.bbox_mmproj_file_var,
+            self.bbox_local_model_path_var,
+            self.bbox_local_mmproj_path_var,
+        )
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=14)
+        row += 1
+        ttk.Button(parent, text="Open Profiles File", command=self._open_profiles_file).grid(row=row, column=0, sticky="w")
+
+    def _add_profile_controls(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        task: str,
+        profile_var: tk.StringVar,
+        model_var: tk.StringVar,
+        repo_var: tk.StringVar,
+        model_file_var: tk.StringVar,
+        mmproj_file_var: tk.StringVar,
+        local_model_path_var: tk.StringVar,
+        local_mmproj_path_var: tk.StringVar,
+    ) -> int:
+        ttk.Label(parent, text="Profile").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        combo = ttk.Combobox(parent, textvariable=profile_var, values=profile_labels(task), state="readonly")
+        combo.grid(row=row, column=1, sticky="ew", pady=4)
+        combo.bind("<<ComboboxSelected>>", lambda _event, t=task: self._on_profile_changed(t))
+        row += 1
+        row = self._add_entry(parent, row, "API model name", model_var)
+
+        hf_frame = ttk.Frame(parent)
+        hf_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
+        hf_row = 0
+        hf_row = self._add_entry(hf_frame, hf_row, "Custom HF repo", repo_var)
+        hf_row = self._add_entry(hf_frame, hf_row, "Custom model file", model_file_var)
+        self._add_entry(hf_frame, hf_row, "Custom mmproj file", mmproj_file_var)
+
+        local_frame = ttk.Frame(parent)
+        local_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._add_file_entry(local_frame, 0, "Local model GGUF", local_model_path_var, "Choose local GGUF model")
+        self._add_file_entry(local_frame, 1, "Local mmproj file", local_mmproj_path_var, "Choose local mmproj file")
+
+        self.custom_profile_frames[task] = {"hf": hf_frame, "local": local_frame}
+        self._update_custom_profile_visibility(task)
+        return row + 1
+
+    def _add_file_entry(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, title: str) -> None:
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Button(parent, text="Browse", command=lambda: self._browse_model_file(variable, title)).grid(
+            row=row,
+            column=2,
+            sticky="e",
+            padx=(6, 0),
+            pady=4,
+        )
+
+    def _browse_model_file(self, variable: tk.StringVar, title: str) -> None:
+        initial = variable.get().strip()
+        initial_dir = str(Path(initial).parent) if initial else self.models_dir_var.get() or str(default_models_dir())
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=initial_dir,
+            filetypes=(("GGUF files", "*.gguf"), ("All files", "*.*")),
+        )
+        if path:
+            variable.set(path)
+
+    def _open_profiles_file(self) -> None:
+        path = default_profiles_path()
+        try:
+            if not path.exists():
+                path.write_text(json.dumps(profile_seed_data(), indent=2), encoding="utf-8")
+            if hasattr(os, "startfile"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except OSError as exc:
+            messagebox.showerror("Could not open profiles file", str(exc))
+
+    def _open_prompts_file(self) -> None:
+        path = default_prompts_path()
+        try:
+            if not path.exists():
+                write_default_prompts(path)
+            if hasattr(os, "startfile"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except OSError as exc:
+            messagebox.showerror("Could not open prompts file", str(exc))
+
+    def _build_pipeline_tab(self, parent: ttk.Frame) -> None:
+        row = 0
+        for text, variable in (
+            ("Add/redo bboxes automatically after JSON generation", self.add_bboxes_var),
+            ("Overwrite existing bboxes", self.overwrite_bboxes_var),
+            ("Skip vague/ambient bbox targets", self.filter_bbox_targets_var),
+            ("Creative text-to-JSON mode", self.creative_var),
+            ("Disable model thinking/reasoning", self.disable_thinking_var),
+        ):
+            ttk.Checkbutton(parent, text=text, variable=variable).grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+            row += 1
+
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=12)
+        row += 1
+        parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text="Vision image format").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            parent,
+            textvariable=self.vision_format_var,
+            values=("auto", "original", "png", "jpeg", "jpg"),
+            state="readonly",
+        ).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        for label, variable in (
+            ("Plain caption max tokens", self.max_caption_tokens_var),
+            ("JSON max tokens", self.max_json_tokens_var),
+            ("BBox max tokens", self.max_bbox_tokens_var),
+            ("BBox context chars", self.context_chars_var),
+            ("Max bbox targets per call", self.max_targets_var),
+        ):
+            row = self._add_entry(parent, row, label, variable)
+
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=14)
+        row += 1
+        ttk.Button(parent, text="Open Prompts Folder", command=self._open_prompts_file).grid(row=row, column=0, sticky="w")
+
+    def _browse_models_dir(self) -> None:
+        folder = filedialog.askdirectory(title="Choose models folder", initialdir=self.models_dir_var.get() or str(default_models_dir()))
+        if folder:
+            self.models_dir_var.set(folder)
+
+    def _browse_llama_server(self) -> None:
+        initial = self.llama_server_path_var.get().strip()
+        initial_dir = str(Path(initial).parent) if initial else str(default_models_dir().parent)
+        path = filedialog.askopenfilename(
+            title="Choose llama-server executable",
+            initialdir=initial_dir,
+            filetypes=(("llama-server", "llama-server.exe llama-server"), ("Executables", "*.exe"), ("All files", "*.*")),
+        )
+        if path:
+            self.llama_server_path_var.set(path)
+
+    def _runtime_mode(self) -> str:
+        return RUNTIME_LABEL_TO_MODE.get(self.runtime_mode_var.get(), "local")
+
+    def _on_runtime_mode_changed(self) -> None:
+        if self._runtime_mode() == "existing":
+            self.auto_start_var.set(False)
+
+    def _profile_for_label(self, task: str, label: str):
+        for profile in profiles_for_task(task):
+            if profile.label == label:
+                return profile
+        return profiles_for_task(task)[0]
+
+    def _update_custom_profile_visibility(self, task: str) -> None:
+        frames = self.custom_profile_frames.get(task)
+        if frames is None:
+            return
+        profile_var = self.bbox_profile_var if task == "bbox" else self.caption_profile_var
+        profile = self._profile_for_label(task, profile_var.get())
+        if profile.kind == "custom_hf":
+            frames["hf"].grid()
+        else:
+            frames["hf"].grid_remove()
+        if profile.kind == "custom_local":
+            frames["local"].grid()
+        else:
+            frames["local"].grid_remove()
+
+    def _on_profile_changed(self, task: str) -> None:
+        if task == "bbox":
+            profile = self._profile_for_label("bbox", self.bbox_profile_var.get())
+            if profile.kind != "custom_hf":
+                self.bbox_model_var.set(profile.api_model)
+            if profile.kind == "server":
+                self.runtime_mode_var.set(RUNTIME_EXISTING_LABEL)
+                self._on_runtime_mode_changed()
+            self._update_custom_profile_visibility("bbox")
+            return
+        profile = self._profile_for_label("caption", self.caption_profile_var.get())
+        if profile.kind != "custom_hf":
+            self.caption_model_var.set(profile.api_model)
+        if profile.kind == "server":
+            self.runtime_mode_var.set(RUNTIME_EXISTING_LABEL)
+            self._on_runtime_mode_changed()
+        self._update_custom_profile_visibility("caption")
+
+    def _test_server(self) -> None:
+        if is_server_ready(self.base_url_var.get().strip(), self.api_key_var.get().strip(), timeout=5.0):
+            messagebox.showinfo("Server ready", "The OpenAI-compatible endpoint responded to /models.")
+        else:
+            messagebox.showwarning("Server unavailable", "The endpoint did not respond to /models.")
+
+    def _parse_int(self, variable: tk.StringVar, label: str, minimum: int = 0) -> int:
+        try:
+            value = int(variable.get().strip())
+        except ValueError as exc:
+            raise ValueError(f"{label} must be an integer.") from exc
+        if value < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        return value
+
+    def _parse_float(self, variable: tk.StringVar, label: str, minimum: float = 0.0) -> float:
+        try:
+            value = float(variable.get().strip())
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a number.") from exc
+        if value < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        return value
+
+    def _save(self) -> None:
+        try:
+            settings = CaptioningSettings(
+                base_url=self.base_url_var.get().strip() or "http://127.0.0.1:8000/v1",
+                api_key=self.api_key_var.get().strip() or "dummy",
+                hf_token=self.hf_token_var.get().strip(),
+                models_dir=self.models_dir_var.get().strip() or str(default_models_dir()),
+                caption_profile_id=profile_id_from_label("caption", self.caption_profile_var.get()),
+                caption_model=self.caption_model_var.get().strip(),
+                caption_hf_repo=self.caption_hf_repo_var.get().strip(),
+                caption_model_filename=self.caption_model_file_var.get().strip(),
+                caption_mmproj_filename=self.caption_mmproj_file_var.get().strip(),
+                caption_local_model_path=self.caption_local_model_path_var.get().strip(),
+                caption_local_mmproj_path=self.caption_local_mmproj_path_var.get().strip(),
+                bbox_profile_id=profile_id_from_label("bbox", self.bbox_profile_var.get()),
+                bbox_model=self.bbox_model_var.get().strip(),
+                bbox_hf_repo=self.bbox_hf_repo_var.get().strip(),
+                bbox_model_filename=self.bbox_model_file_var.get().strip(),
+                bbox_mmproj_filename=self.bbox_mmproj_file_var.get().strip(),
+                bbox_local_model_path=self.bbox_local_model_path_var.get().strip(),
+                bbox_local_mmproj_path=self.bbox_local_mmproj_path_var.get().strip(),
+                add_bboxes_after_json=self.add_bboxes_var.get(),
+                overwrite_bboxes=self.overwrite_bboxes_var.get(),
+                filter_bbox_targets=self.filter_bbox_targets_var.get(),
+                use_caption_model_for_bboxes=False,
+                creative_json=self.creative_var.get(),
+                disable_thinking=self.disable_thinking_var.get(),
+                vision_image_format=self.vision_format_var.get(),
+                max_tokens_caption=self._parse_int(self.max_caption_tokens_var, "Plain caption max tokens", 1),
+                max_tokens_json=self._parse_int(self.max_json_tokens_var, "JSON max tokens", 1),
+                max_tokens_bboxes=self._parse_int(self.max_bbox_tokens_var, "BBox max tokens", 1),
+                context_chars=self._parse_int(self.context_chars_var, "BBox context chars", 0),
+                max_targets_per_call=self._parse_int(self.max_targets_var, "Max bbox targets per call", 0),
+                server_start_mode=self._runtime_mode(),
+                auto_start_server=self.auto_start_var.get() and self._runtime_mode() != "existing",
+                llama_server_path=self.llama_server_path_var.get().strip(),
+                llama_context=self._parse_int(self.llama_context_var, "Context size", 512),
+                llama_gpu_layers=self._parse_int(self.llama_gpu_layers_var, "GPU layers", 0),
+                llama_batch=self._parse_int(self.llama_batch_var, "Batch size", 1),
+                llama_ubatch=self._parse_int(self.llama_ubatch_var, "Ubatch size", 1),
+                llama_threads=self._parse_int(self.llama_threads_var, "CPU threads", 0),
+                llama_reasoning_budget=self._parse_int(
+                    self.llama_reasoning_budget_var,
+                    "Thinking token budget",
+                    -1,
+                ),
+                llama_extra_args=self.llama_extra_args_var.get().strip(),
+                caption_server_command=self.caption_server_command_var.get().strip(),
+                bbox_server_command=self.bbox_server_command_var.get().strip(),
+                server_startup_timeout=self._parse_float(self.server_timeout_var, "Startup timeout seconds", 1.0),
+                stop_server_after_job=self.stop_server_var.get(),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid preferences", str(exc))
+            return
+
+        self.result = settings
+        self.destroy()
+
+
 class CaptionEditorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -149,6 +689,7 @@ class CaptionEditorApp(tk.Tk):
 
         self.folder: Path | None = None
         self.store: CaptionStore | None = None
+        self.all_images: list[Path] = []
         self.images: list[Path] = []
         self.current_index = -1
         self.current_caption: dict[str, Any] = default_caption()
@@ -174,11 +715,26 @@ class CaptionEditorApp(tk.Tk):
         self.current_canvas_cursor = ""
         self.fullscreen = False
         self.drag_threshold = 4
+        self.captioning_settings = load_settings()
+        self.ai_worker: threading.Thread | None = None
+        self.ai_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.ai_undo_stack: list[dict[str, Any]] = []
+        self.ai_buttons: list[ttk.Button] = []
+        self.ai_cancel_button: ttk.Button | None = None
+        self.ai_cancel_event: threading.Event | None = None
+        self.ai_server_process: subprocess.Popen | None = None
+        self.ai_server_command: str | None = None
+        self.ai_server_phase: str | None = None
+        self.pending_image_select_job: str | None = None
+        self.last_image_click_index: int | None = None
+        self.image_selection_anchor_path: Path | None = None
 
         self.caption_extension_var = tk.StringVar(value=".json")
         self.original_extension_var = tk.StringVar(value=".txt")
         self.image_sort_var = tk.StringVar(value=IMAGE_SORT_NAME_ASC)
         self.status_var = tk.StringVar(value="Open a folder to begin.")
+        self.ai_progress_var = tk.DoubleVar(value=0.0)
+        self.ai_progress_text_var = tk.StringVar(value="")
         self.original_status_var = tk.StringVar(value="Original: .txt")
         self.image_title_var = tk.StringVar(value="No image loaded")
         self.style_mode_var = tk.StringVar(value="photo")
@@ -242,12 +798,12 @@ class CaptionEditorApp(tk.Tk):
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#252b36", foreground="#d9dee9")
 
     def _build_ui(self) -> None:
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
         self.columnconfigure(0, weight=1)
 
         toolbar = ttk.Frame(self, style="Toolbar.TFrame", padding=(8, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(9, weight=1)
+        toolbar.columnconfigure(10, weight=1)
 
         ttk.Button(toolbar, text="Open Folder", command=self.open_folder_dialog).grid(row=0, column=0, padx=(0, 8))
         ttk.Label(toolbar, text="Caption files", style="Status.TLabel").grid(row=0, column=1, padx=(0, 6))
@@ -272,10 +828,26 @@ class CaptionEditorApp(tk.Tk):
         ttk.Button(toolbar, text="Copy to edit", command=self.copy_current_image_to_edit).grid(row=0, column=6, padx=(0, 8))
         ttk.Button(toolbar, text="Previous", command=self.previous_image).grid(row=0, column=7, padx=(0, 4))
         ttk.Button(toolbar, text="Next", command=self.next_image).grid(row=0, column=8, padx=(0, 8))
-        ttk.Label(toolbar, textvariable=self.status_var, style="Status.TLabel", anchor="e").grid(row=0, column=9, sticky="ew")
+        ttk.Button(toolbar, text="Preferences", command=self.open_captioning_preferences).grid(row=0, column=9, padx=(0, 8))
+        ttk.Label(toolbar, textvariable=self.status_var, style="Status.TLabel", anchor="e").grid(row=0, column=10, sticky="ew")
+
+        self.ai_progress_frame = ttk.Frame(self, style="Toolbar.TFrame", padding=(8, 0, 8, 6))
+        self.ai_progress_frame.grid(row=1, column=0, sticky="ew")
+        self.ai_progress_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.ai_progress_frame, textvariable=self.ai_progress_text_var, style="Status.TLabel", width=26).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self.ai_progress_bar = ttk.Progressbar(
+            self.ai_progress_frame,
+            variable=self.ai_progress_var,
+            mode="determinate",
+            maximum=1,
+        )
+        self.ai_progress_bar.grid(row=0, column=1, sticky="ew")
+        self.ai_progress_frame.grid_remove()
 
         self.paned = ttk.PanedWindow(self, orient="horizontal")
-        self.paned.grid(row=1, column=0, sticky="nsew")
+        self.paned.grid(row=2, column=0, sticky="nsew")
 
         list_frame = ttk.Frame(self.paned, width=180, padding=(10, 10), style="Panel.TFrame")
         list_frame.rowconfigure(2, weight=1)
@@ -304,6 +876,7 @@ class CaptionEditorApp(tk.Tk):
             highlightthickness=0,
             relief="flat",
             exportselection=False,
+            selectmode="extended",
         )
         image_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.image_list.yview)
         self.image_list.configure(yscrollcommand=image_scroll.set)
@@ -334,6 +907,8 @@ class CaptionEditorApp(tk.Tk):
         self.image_title_label = ttk.Label(parent, textvariable=self.image_title_var, style="Section.TLabel")
         self.image_title_label.grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
+
+        row = self._build_ai_controls(parent, row)
 
         self.high_text, row = self._add_text(
             parent,
@@ -504,6 +1079,37 @@ class CaptionEditorApp(tk.Tk):
         self._bind_text(self.original_text, self._on_original_change)
         self._enable_text_autofit(self.original_text, 8, 24)
         self.update_original_text_state()
+
+    def _build_ai_controls(self, parent: ttk.Frame, row: int) -> int:
+        ttk.Label(parent, text="Auto Captioning", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(0, 6))
+        row += 1
+        ai_frame = ttk.Frame(parent)
+        ai_frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        for column in range(2):
+            ai_frame.columnconfigure(column, weight=1)
+
+        buttons = (
+            ("Text Caption", self.auto_generate_text_caption),
+            ("JSON from Text", self.auto_generate_json_from_text),
+            ("JSON from Image", self.auto_generate_json_from_image),
+            ("Add/redo BBoxes", self.auto_generate_bboxes),
+            ("Retry Failed", self.retry_failed_captions),
+            ("Clear Failed", self.clear_failed_markers),
+            ("Undo AI", self.undo_last_ai_job),
+            ("Prefs", self.open_captioning_preferences),
+        )
+        self.ai_buttons = []
+        for index, (label, command) in enumerate(buttons):
+            button = ttk.Button(ai_frame, text=label, command=command)
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 4, 0), pady=(0, 4))
+            self.ai_buttons.append(button)
+        cancel_row = (len(buttons) + 1) // 2
+        self.ai_cancel_button = ttk.Button(ai_frame, text="Cancel Run", command=self.cancel_ai_job, state="disabled")
+        self.ai_cancel_button.grid(row=cancel_row, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        row += 1
+
+        ttk.Separator(parent).grid(row=row, column=0, sticky="ew", pady=(4, 12))
+        return row + 1
 
     def _make_text(self, parent: tk.Widget, height: int) -> tk.Text:
         return tk.Text(
@@ -745,6 +1351,9 @@ class CaptionEditorApp(tk.Tk):
             var.trace_add("write", lambda *_args: self._on_element_change())
 
         self.image_list.bind("<<ListboxSelect>>", self.on_image_list_select)
+        self.image_list.bind("<ButtonPress-1>", self.remember_image_list_click, add="+")
+        self.image_list.bind("<Control-a>", self.select_all_images)
+        self.image_list.bind("<Control-A>", self.select_all_images)
         self.elements_tree.bind("<<TreeviewSelect>>", self.on_element_tree_select)
         self.canvas.bind("<Configure>", lambda _event: self.render_image())
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
@@ -912,9 +1521,40 @@ class CaptionEditorApp(tk.Tk):
     def image_has_caption(self, image_path: Path) -> bool:
         return self.store is not None and self.store.caption_path(image_path).exists()
 
+    def image_has_failure_marker(self, image_path: Path) -> bool:
+        return self.store is not None and self.store.has_failure_marker(image_path)
+
     def image_has_original(self, image_path: Path) -> bool:
         original_path = self.original_path_for_image(image_path)
         return original_path is not None and original_path.exists()
+
+    def image_has_missing_bboxes(self, image_path: Path) -> bool:
+        if self.store is None:
+            return False
+        caption_path = self.store.caption_path(image_path)
+        if not caption_path.exists():
+            return False
+        try:
+            caption, message = self.store.load_caption(image_path)
+        except OSError:
+            return False
+        if message and "Could not parse" in message:
+            return False
+        elements = normalize_caption(caption).get("compositional_deconstruction", {}).get("elements", [])
+        return any(
+            isinstance(element, dict)
+            and element.get("type") in {"obj", "text"}
+            and normalize_bbox(element.get("bbox")) is None
+            for element in elements
+        )
+
+    def visible_images_for_current_mode(self) -> list[Path]:
+        images = list(self.all_images)
+        if self.image_sort_var.get() == IMAGE_SORT_BBOX_MISSING:
+            images = [image_path for image_path in images if self.image_has_missing_bboxes(image_path)]
+        elif self.image_sort_var.get() == IMAGE_SORT_FAILED:
+            images = [image_path for image_path in images if self.image_has_failure_marker(image_path)]
+        return images
 
     def sorted_images(self, images: list[Path]) -> list[Path]:
         sort_mode = self.image_sort_var.get()
@@ -934,27 +1574,46 @@ class CaptionEditorApp(tk.Tk):
         current_path = None
         if preserve_current and 0 <= self.current_index < len(self.images):
             current_path = self.images[self.current_index]
-        self.images = self.sorted_images(self.images)
+        self.images = self.sorted_images(self.visible_images_for_current_mode())
         if current_path is not None and current_path in self.images:
             self.current_index = self.images.index(current_path)
-        elif self.current_index >= len(self.images):
-            self.current_index = len(self.images) - 1
+        elif not self.images:
+            self.current_index = -1
+        elif not preserve_current:
+            self.current_index = -1
+        else:
+            self.current_index = min(max(self.current_index, 0), len(self.images) - 1)
+
+    def clear_loaded_image(self, message: str) -> None:
+        self.current_index = -1
+        self.image_title_var.set("No image loaded")
+        self.current_caption = default_caption()
+        self.selected_element_index = None
+        if self.pil_image is not None:
+            self.pil_image.close()
+        self.pil_image = None
+        self.canvas_image_id = None
+        self.image_render_key = None
+        self.clear_original_text("Original: no image loaded")
+        self.populate_form()
+        self.render_image()
+        self.status_var.set(message)
 
     def open_folder(self, folder: Path) -> None:
         self.save_current()
         self.folder = folder
         self.store = CaptionStore(folder, self.caption_extension_var.get())
-        self.images = self.store.images()
+        self.all_images = self.store.images()
+        self.images = []
         self.current_index = -1
         self.apply_image_sort(preserve_current=False)
         self.populate_image_list()
-        if not self.images:
+        if not self.all_images:
             self.status_var.set(f"No images found in {folder}")
-            self.image_title_var.set("No image loaded")
-            self.current_caption = default_caption()
-            self.pil_image = None
-            self.clear_original_text("Original: no image loaded")
-            self.render_image()
+            self.clear_loaded_image(f"No images found in {folder}")
+            return
+        if not self.images:
+            self.clear_loaded_image(f"No images match {self.image_sort_var.get()}.")
             return
         self.load_image_at(0)
 
@@ -965,32 +1624,158 @@ class CaptionEditorApp(tk.Tk):
             self.loading_list = False
             return
         for index, image_path in enumerate(self.images, start=1):
-            marker = " " if self.store.caption_path(image_path).exists() else "+"
+            if self.store.has_failure_marker(image_path):
+                marker = "!"
+            else:
+                marker = " " if self.store.caption_path(image_path).exists() else "+"
             self.image_list.insert("end", f"{index:04d} {marker} {image_path.name}")
         self.loading_list = False
 
     def on_image_list_select(self, _event: tk.Event) -> None:
         if self.loading_list:
             return
+        if self.pending_image_select_job is not None:
+            self.after_cancel(self.pending_image_select_job)
+        self.pending_image_select_job = self.after_idle(self.finish_image_list_select)
+
+    def image_list_index_from_event(self, event: tk.Event) -> int | None:
+        if not self.images:
+            return None
+        index = int(self.image_list.nearest(event.y))
+        if not (0 <= index < len(self.images)):
+            return None
+        item_bbox = self.image_list.bbox(index)
+        if item_bbox is not None:
+            _x, y, _width, height = item_bbox
+            if event.y < y or event.y > y + height:
+                return None
+        return index
+
+    def current_image_selection_anchor_index(self) -> int | None:
+        if self.image_selection_anchor_path is not None:
+            try:
+                return self.images.index(self.image_selection_anchor_path)
+            except ValueError:
+                pass
+        if 0 <= self.current_index < len(self.images):
+            return self.current_index
         selection = self.image_list.curselection()
         if selection:
-            self.load_image_at(selection[0])
+            index = int(selection[0])
+            if 0 <= index < len(self.images):
+                return index
+        return None
+
+    def remember_image_list_click(self, event: tk.Event) -> str | None:
+        self.last_image_click_index = None
+        index = self.image_list_index_from_event(event)
+        if index is None:
+            return None
+        self.last_image_click_index = index
+        if event.state & SHIFT_MASK:
+            anchor = self.current_image_selection_anchor_index()
+            if anchor is None:
+                anchor = index
+                self.image_selection_anchor_path = self.images[index]
+            first, last = sorted((anchor, index))
+            self.loading_list = True
+            if not (event.state & CONTROL_MASK):
+                self.image_list.selection_clear(0, "end")
+            self.image_list.selection_set(first, last)
+            self.image_list.activate(index)
+            self.image_list.see(index)
+            if hasattr(self.image_list, "selection_anchor"):
+                self.image_list.selection_anchor(anchor)
+            self.loading_list = False
+            self.on_image_list_select(event)
+            return "break"
+        self.image_selection_anchor_path = self.images[index]
+        return None
+
+    def current_image_selection_paths(self) -> list[Path]:
+        if not self.images:
+            return []
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for raw_index in self.image_list.curselection():
+            index = int(raw_index)
+            if 0 <= index < len(self.images):
+                image_path = self.images[index]
+                if image_path not in seen:
+                    paths.append(image_path)
+                    seen.add(image_path)
+        return paths
+
+    def image_indices_for_paths(self, image_paths: list[Path] | tuple[Path, ...] | None) -> tuple[int, ...]:
+        if not image_paths:
+            return ()
+        selected_paths = set(image_paths)
+        return tuple(index for index, image_path in enumerate(self.images) if image_path in selected_paths)
+
+    def flush_pending_image_selection(self) -> None:
+        if self.pending_image_select_job is None:
+            return
+        pending_job = self.pending_image_select_job
+        self.pending_image_select_job = None
+        try:
+            self.after_cancel(pending_job)
+        except tk.TclError:
+            pass
+        self.finish_image_list_select()
+
+    def finish_image_list_select(self) -> None:
+        self.pending_image_select_job = None
+        if self.loading_list:
+            return
+        selection = tuple(int(index) for index in self.image_list.curselection())
+        clicked_index = self.last_image_click_index
+        self.last_image_click_index = None
+        if selection:
+            if clicked_index is not None and clicked_index in selection:
+                index = clicked_index
+            else:
+                try:
+                    active = int(self.image_list.index("active"))
+                except tk.TclError:
+                    active = selection[0]
+                index = active if active in selection else selection[0]
+            self.load_image_at(index, preserve_selection=True)
+
+    def select_all_images(self, _event: tk.Event | None = None) -> str:
+        if not self.images:
+            return "break"
+        self.loading_list = True
+        self.image_list.selection_set(0, "end")
+        if self.current_index >= 0:
+            self.image_selection_anchor_path = self.images[self.current_index]
+            self.image_list.activate(self.current_index)
+            self.image_list.see(self.current_index)
+        self.loading_list = False
+        self.status_var.set(f"Selected {len(self.images)} images.")
+        return "break"
 
     def on_image_sort_changed(self, _event: tk.Event) -> None:
+        selected_paths = self.current_image_selection_paths()
         if self.dirty or self.original_dirty:
             self.save_current()
         self.apply_image_sort(preserve_current=True)
         self.populate_image_list()
-        self.populate_image_selection()
-        self.status_var.set(f"Sorted images by {self.image_sort_var.get()}.")
+        if self.images:
+            self.populate_image_selection(selected_paths=selected_paths)
+            self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
+            self.status_var.set(f"Sorted images by {self.image_sort_var.get()}.")
+        else:
+            self.clear_loaded_image(f"No images match {self.image_sort_var.get()}.")
 
-    def load_image_at(self, index: int) -> None:
+    def load_image_at(self, index: int, preserve_selection: bool = False, skip_save: bool = False, force_reload: bool = False) -> None:
         if index < 0 or index >= len(self.images):
             return
-        if index == self.current_index:
+        if index == self.current_index and not force_reload:
             return
+        selected_paths = self.current_image_selection_paths() if preserve_selection else []
         self.cancel_eyedrop()
-        self.save_current()
+        if not skip_save:
+            self.save_current()
         self.current_index = index
         image_path = self.images[index]
         self.image_title_var.set(image_path.name)
@@ -1022,7 +1807,7 @@ class CaptionEditorApp(tk.Tk):
         self.selected_element_index = 0 if elements else None
         self.load_original_text(image_path)
         self.populate_form()
-        self.populate_image_selection()
+        self.populate_image_selection(selected_paths=selected_paths if preserve_selection else None)
         self.editor.scroll_to_top()
         self.render_image()
         if message:
@@ -1030,12 +1815,32 @@ class CaptionEditorApp(tk.Tk):
         else:
             self.status_var.set(f"{index + 1}/{len(self.images)} {image_path.name}")
 
-    def populate_image_selection(self) -> None:
+    def populate_image_selection(
+        self,
+        selected_indices: tuple[int, ...] | None = None,
+        selected_paths: list[Path] | tuple[Path, ...] | None = None,
+    ) -> None:
+        if selected_paths is not None:
+            selected_indices = self.image_indices_for_paths(selected_paths)
         self.loading_list = True
         self.image_list.selection_clear(0, "end")
-        if self.current_index >= 0:
+        selected_any = False
+        if selected_indices:
+            for index in selected_indices:
+                if 0 <= index < len(self.images):
+                    self.image_list.selection_set(index)
+                    selected_any = True
+            if self.current_index >= 0:
+                self.image_list.activate(self.current_index)
+                self.image_list.see(self.current_index)
+        if not selected_any and self.current_index >= 0:
             self.image_list.selection_set(self.current_index)
+            self.image_list.activate(self.current_index)
             self.image_list.see(self.current_index)
+            self.image_selection_anchor_path = self.images[self.current_index]
+        anchor_index = self.current_image_selection_anchor_index()
+        if anchor_index is not None and hasattr(self.image_list, "selection_anchor"):
+            self.image_list.selection_anchor(anchor_index)
         self.loading_list = False
 
     def populate_form(self) -> None:
@@ -1358,6 +2163,649 @@ class CaptionEditorApp(tk.Tk):
     def fit_selected_bbox_to_image(self) -> None:
         self.set_selected_bbox([0, 0, 1000, 1000], mark=True)
 
+    def open_captioning_preferences(self) -> None:
+        dialog = CaptioningPreferencesDialog(self, self.captioning_settings)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self.captioning_settings = dialog.result
+        try:
+            path = save_settings(self.captioning_settings)
+        except OSError as exc:
+            messagebox.showerror("Preferences not saved", str(exc))
+            return
+        self.status_var.set(f"Saved auto-captioning preferences to {path.name}.")
+
+    def auto_generate_text_caption(self) -> None:
+        self.save_current()
+        self.ensure_original_extension_for_ai()
+        self.start_ai_job("text", "text captions")
+
+    def auto_generate_json_from_text(self) -> None:
+        self.save_current()
+        self.ensure_original_extension_for_ai()
+        self.start_ai_job("json_text", "JSON captions from text")
+
+    def auto_generate_json_from_image(self) -> None:
+        self.start_ai_job("json_image", "JSON captions from image")
+
+    def auto_generate_bboxes(self) -> None:
+        self.start_ai_job("bboxes", "bboxes")
+
+    def failed_image_paths_for_ai(self) -> list[Path]:
+        if self.store is None or not self.images:
+            return []
+        selection = self.current_image_selection_paths()
+        candidates = selection if selection else []
+        if not candidates and self.image_sort_var.get() == IMAGE_SORT_FAILED:
+            candidates = list(self.images)
+        if not candidates and 0 <= self.current_index < len(self.images):
+            candidates = [self.images[self.current_index]]
+        return [image_path for image_path in candidates if self.store.has_failure_marker(image_path)]
+
+    def retry_failed_captions(self) -> None:
+        image_paths = self.failed_image_paths_for_ai()
+        if not image_paths:
+            self.status_var.set("Select one or more images with failure markers.")
+            return
+        self.start_ai_job("retry_failed", "retry failed captions", image_paths=image_paths)
+
+    def clear_failed_markers(self) -> None:
+        if self.store is None:
+            self.status_var.set("Open an image folder before clearing failure markers.")
+            return
+        image_paths = self.failed_image_paths_for_ai()
+        if not image_paths:
+            self.status_var.set("Select one or more images with failure markers.")
+            return
+        if len(image_paths) > 1 and not messagebox.askyesno(
+            "Clear failure markers",
+            f"Clear failure markers for {len(image_paths)} image(s)?",
+        ):
+            return
+        cleared = 0
+        try:
+            for image_path in image_paths:
+                if self.store.clear_failure_marker(image_path):
+                    cleared += 1
+        except OSError as exc:
+            messagebox.showerror("Clear failed", str(exc))
+            return
+        self.refresh_after_ai_job(f"Cleared {cleared} failure marker(s).")
+
+    def ensure_original_extension_for_ai(self) -> None:
+        if self.current_index < 0 or self.current_index >= len(self.images):
+            return
+        extension = self.selected_original_extension()
+        if extension is None:
+            self.original_extension_var.set(".txt")
+            extension = ".txt"
+        image_path = self.images[self.current_index]
+        if self.store is not None and image_path.with_suffix(extension) == self.store.caption_path(image_path):
+            self.original_extension_var.set(".original")
+        self.load_original_text(image_path)
+
+    def set_ai_controls_running(self, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for button in self.ai_buttons:
+            button.configure(state=state)
+        if self.ai_cancel_button is not None:
+            self.ai_cancel_button.configure(state="normal" if running else "disabled")
+
+    def cancel_ai_job(self) -> None:
+        if self.ai_worker is None or not self.ai_worker.is_alive() or self.ai_cancel_event is None:
+            self.status_var.set("No auto-captioning job is running.")
+            return
+        self.ai_cancel_event.set()
+        if self.ai_cancel_button is not None:
+            self.ai_cancel_button.configure(state="disabled")
+        self.status_var.set("Cancel requested. Waiting for the current model request to finish...")
+
+    def show_ai_progress(self, label: str, total: int) -> None:
+        maximum = max(1, total)
+        self.ai_progress_bar.configure(maximum=maximum)
+        self.ai_progress_var.set(0)
+        self.ai_progress_text_var.set(f"{label}: 0/{total}")
+        self.ai_progress_frame.grid()
+
+    def update_ai_progress(self, label: str, current: int, total: int) -> None:
+        total = max(1, total)
+        current = max(0, min(current, total))
+        self.ai_progress_bar.configure(maximum=total)
+        self.ai_progress_var.set(current)
+        self.ai_progress_text_var.set(f"{label}: {current}/{total}")
+        self.ai_progress_frame.grid()
+
+    def selected_image_paths_for_ai(self) -> list[Path]:
+        if not self.images:
+            return []
+        selection = self.current_image_selection_paths()
+        if selection:
+            return selection
+        if 0 <= self.current_index < len(self.images):
+            return [self.images[self.current_index]]
+        return []
+
+    def writable_original_path_for_image(self, image_path: Path) -> Path:
+        original_path = self.original_path_for_image(image_path)
+        if original_path is not None and (self.store is None or self.store.caption_path(image_path) != original_path):
+            return original_path
+        extension = ".txt"
+        if self.store is not None and self.store.caption_path(image_path).suffix.lower() == extension:
+            extension = ".original"
+        return image_path.with_suffix(extension)
+
+    def read_text_file_if_exists(self, path: Path) -> str:
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8-sig").strip()
+
+    def file_snapshot(self, path: Path) -> dict[str, Any]:
+        if path.exists():
+            return {"path": str(path), "exists": True, "text": path.read_text(encoding="utf-8-sig")}
+        return {"path": str(path), "exists": False, "text": ""}
+
+    def capture_ai_undo_snapshot(self, targets: list[dict[str, Path]], label: str) -> dict[str, Any]:
+        return {
+            "label": label,
+            "items": [
+                {
+                    "image_path": str(target["image_path"]),
+                    "caption": self.file_snapshot(target["caption_path"]),
+                    "original": self.file_snapshot(target["original_path"]),
+                    "failure": self.file_snapshot(target["failure_path"]),
+                }
+                for target in targets
+            ],
+        }
+
+    def restore_file_snapshot(self, snapshot: dict[str, Any]) -> None:
+        path = Path(snapshot["path"])
+        if snapshot.get("exists"):
+            path.write_text(str(snapshot.get("text", "")), encoding="utf-8")
+        elif path.exists():
+            path.unlink()
+
+    def undo_last_ai_job(self) -> None:
+        if self.ai_worker is not None and self.ai_worker.is_alive():
+            self.status_var.set("Wait for the current auto-captioning job to finish before undoing.")
+            return
+        if not self.ai_undo_stack:
+            self.status_var.set("No AI captioning job to undo.")
+            return
+        snapshot = self.ai_undo_stack[-1]
+        if not messagebox.askyesno("Undo AI captioning", f"Restore sidecars changed by the last {snapshot['label']} job?"):
+            return
+        try:
+            for item in snapshot["items"]:
+                self.restore_file_snapshot(item["caption"])
+                self.restore_file_snapshot(item["original"])
+                if "failure" in item:
+                    self.restore_file_snapshot(item["failure"])
+        except OSError as exc:
+            messagebox.showerror("Undo failed", str(exc))
+            return
+        self.ai_undo_stack.pop()
+        self.refresh_after_ai_job(f"Undid last {snapshot['label']} job.")
+
+    def start_ai_job(self, operation: str, label: str, image_paths: list[Path] | None = None) -> None:
+        if self.ai_worker is not None and self.ai_worker.is_alive():
+            self.status_var.set("Auto-captioning is already running.")
+            return
+        if self.store is None or self.folder is None:
+            self.status_var.set("Open an image folder before auto-captioning.")
+            return
+
+        self.flush_pending_image_selection()
+        image_paths = image_paths if image_paths is not None else self.selected_image_paths_for_ai()
+        if not image_paths:
+            self.status_var.set("Select at least one image.")
+            return
+        if len(image_paths) > 1:
+            confirmed = messagebox.askyesno(
+                "Confirm batch auto-captioning",
+                f"Run {label} on {len(image_paths)} selected images?",
+            )
+            if not confirmed:
+                return
+
+        self.save_current()
+        caption_extension = self.caption_extension_var.get()
+        targets = [
+            {
+                "image_path": image_path,
+                "caption_path": image_path.with_suffix(caption_extension),
+                "original_path": self.writable_original_path_for_image(image_path),
+                "failure_path": image_path.with_suffix(".caption_failed.json"),
+            }
+            for image_path in image_paths
+        ]
+        snapshot = self.capture_ai_undo_snapshot(targets, label)
+        settings = self.captioning_settings
+        folder = self.folder
+        managed_process = self.ai_server_process
+        managed_command = self.ai_server_command
+        managed_phase = self.ai_server_phase
+        self.ai_server_process = None
+        self.ai_server_command = None
+        self.ai_server_phase = None
+        self.ai_cancel_event = threading.Event()
+
+        self.set_ai_controls_running(True)
+        self.show_ai_progress(label, len(targets))
+        self.status_var.set(f"Starting {label} for {len(targets)} image(s)...")
+        self.ai_worker = threading.Thread(
+            target=self.ai_worker_main,
+            args=(
+                operation,
+                label,
+                targets,
+                snapshot,
+                settings,
+                folder,
+                caption_extension,
+                managed_process,
+                managed_command,
+                managed_phase,
+                self.ai_cancel_event,
+            ),
+            daemon=True,
+        )
+        self.ai_worker.start()
+        self.after(100, self.poll_ai_queue)
+
+    def ai_worker_main(
+        self,
+        operation: str,
+        label: str,
+        targets: list[dict[str, Path]],
+        snapshot: dict[str, Any],
+        settings: CaptioningSettings,
+        folder: Path,
+        caption_extension: str,
+        managed_process: subprocess.Popen | None,
+        managed_command: str | None,
+        managed_phase: str | None,
+        cancel_event: threading.Event,
+    ) -> None:
+        store = CaptionStore(folder, caption_extension)
+        ok = 0
+        failed = 0
+        changed = 0
+        bbox_attempted_total = 0
+        bbox_written_total = 0
+        bbox_reason_totals: dict[str, int] = {}
+        errors: list[str] = []
+        canceled = False
+
+        class AiJobCanceled(Exception):
+            pass
+
+        def progress(message: str | None = None, current: int | None = None, total: int | None = None) -> None:
+            event: dict[str, Any] = {"type": "progress", "label": label}
+            if message is not None:
+                event["message"] = message
+            if current is not None:
+                event["current"] = current
+            if total is not None:
+                event["total"] = total
+            self.ai_queue.put(event)
+
+        def ensure_endpoint_exposes_model(config_label: str, api_model: str) -> None:
+            try:
+                model_ids = server_model_ids(settings.base_url, settings.api_key, timeout=5.0)
+            except Exception as exc:
+                raise AutoCaptionError(f"Captioning server is not reachable at {settings.base_url}: {exc}") from exc
+            if api_model and model_ids and api_model not in model_ids:
+                available = ", ".join(sorted(model_ids)) or "(none)"
+                raise AutoCaptionError(
+                    f"Server at {settings.base_url} is running, but it does not expose the selected model alias "
+                    f"'{api_model}' for {config_label}. Available aliases: {available}. "
+                    "Stop the existing server, change the API model name/profile, or switch Preferences to "
+                    "'Connect to existing server' with the matching alias."
+                )
+
+        def format_bbox_reasons(reason_counts: dict[str, int]) -> str:
+            if not reason_counts:
+                return ""
+            parts = [f"{reason}={count}" for reason, count in sorted(reason_counts.items())]
+            return " (" + "; ".join(parts) + ")"
+
+        def record_bbox_result(image_name: str, attempted: int, written: int, reason_counts: dict[str, int]) -> None:
+            nonlocal bbox_attempted_total, bbox_written_total
+            bbox_attempted_total += attempted
+            bbox_written_total += written
+            for reason, count in reason_counts.items():
+                bbox_reason_totals[reason] = bbox_reason_totals.get(reason, 0) + count
+            progress(
+                f"{image_name}: bbox targets={attempted}, written={written}, "
+                f"skipped={attempted - written}{format_bbox_reasons(reason_counts)}"
+            )
+
+        def prepare_task(task: str) -> None:
+            nonlocal managed_process, managed_command, managed_phase
+            if cancel_event.is_set():
+                raise AiJobCanceled()
+            config = runtime_config_for_task(settings, task)
+            if settings.server_start_mode == "existing" or not settings.auto_start_server:
+                ensure_endpoint_exposes_model(config.label, config.api_model)
+                return
+
+            command_task = task
+            if managed_process is not None and managed_process.poll() is not None:
+                managed_process = None
+                managed_command = None
+                managed_phase = None
+            if managed_process is None and is_server_ready(settings.base_url, settings.api_key, timeout=3.0):
+                ensure_endpoint_exposes_model(config.label, config.api_model)
+                progress(f"Endpoint is already running with {config.api_model}.")
+                return
+            if settings.server_start_mode == "local":
+                server_path = Path(settings.llama_server_path).expanduser() if settings.llama_server_path.strip() else find_llama_server()
+                if server_path is None or not server_path.exists():
+                    raise AutoCaptionError("Choose llama-server.exe in Preferences before using local captioning.")
+                if config.kind == "server":
+                    raise AutoCaptionError("Existing server alias profiles require the 'Connect to existing server' runtime.")
+
+            progress(f"Checking {config.label} assets...")
+            assets = ensure_model_assets(settings, task, progress)
+            if settings.server_start_mode == "local":
+                command = build_llama_server_command(settings, task, assets)
+            else:
+                template = settings.caption_server_command if command_task == "caption" else settings.bbox_server_command
+                command = format_server_command(template, settings, task, assets)
+
+            if managed_process is not None and managed_command != command:
+                progress(f"Stopping {managed_phase or 'previous'} server...")
+                stop_server_process(managed_process)
+                managed_process = None
+                managed_command = None
+                managed_phase = None
+            if managed_process is not None:
+                return
+            name = "caption" if command_task == "caption" else "bbox"
+            managed_process = start_server_process(
+                command=command,
+                base_url=settings.base_url,
+                api_key=settings.api_key,
+                log_dir=Path(settings.models_dir).expanduser().resolve() / "server_logs",
+                name=f"{name}_server",
+                startup_timeout=settings.server_startup_timeout,
+                progress=progress,
+            )
+            managed_command = command
+            managed_phase = name
+
+        def preview_text(text: str, limit: int = 4000) -> str:
+            text = text.strip()
+            if len(text) <= limit:
+                return text
+            return text[:limit].rstrip() + f"\n... truncated {len(text) - limit} character(s)"
+
+        def model_alias_for_task(task: str) -> str:
+            try:
+                return runtime_config_for_task(settings, task).api_model
+            except Exception:
+                return ""
+
+        def classify_failure(exc: Exception, task: str) -> str:
+            if isinstance(exc, ModelJsonError):
+                return "bbox_json_parse_failed" if task == "bbox" else "caption_json_parse_failed"
+            text = str(exc).lower()
+            if "no source text caption" in text:
+                return "missing_source_text"
+            if task == "bbox" and "response must contain" in text:
+                return "bbox_json_parse_failed"
+            if "server" in text or "endpoint" in text or "llama" in text:
+                return "server_failed"
+            if "model request failed" in text or "returned an empty response" in text:
+                return "model_request_failed"
+            return "auto_caption_failed"
+
+        def build_failure_marker(
+            image_path: Path,
+            target: dict[str, Path],
+            effective_operation: str,
+            task: str,
+            exc: Exception,
+        ) -> dict[str, Any]:
+            retry_operation = (
+                "bboxes" if task == "bbox" and effective_operation in {"json_text", "json_image"} else effective_operation
+            )
+            marker: dict[str, Any] = {
+                "version": 1,
+                "image": image_path.name,
+                "caption_path": target["caption_path"].name,
+                "operation": retry_operation,
+                "source_operation": effective_operation,
+                "label": label,
+                "task": task,
+                "reason": classify_failure(exc, task),
+                "model": model_alias_for_task(task),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": str(exc),
+                "can_retry": True,
+            }
+            if isinstance(exc, ModelJsonError):
+                if exc.raw_output:
+                    marker["raw_output_preview"] = preview_text(exc.raw_output)
+                if exc.repair_output:
+                    marker["repair_output_preview"] = preview_text(exc.repair_output)
+            return marker
+
+        def retry_operation_for_marker(image_path: Path) -> str:
+            marker = store.load_failure_marker(image_path)
+            operation_from_marker = str(marker.get("operation", "")).strip() if marker else ""
+            if operation_from_marker in {"text", "json_text", "json_image", "bboxes"}:
+                return operation_from_marker
+            return "json_image"
+
+        try:
+            for index, target in enumerate(targets, start=1):
+                if cancel_event.is_set():
+                    canceled = True
+                    progress(f"Canceled {label} after {ok + failed}/{len(targets)} image(s).", current=ok + failed, total=len(targets))
+                    break
+                image_path = target["image_path"]
+                effective_operation = retry_operation_for_marker(image_path) if operation == "retry_failed" else operation
+                failure_task = "caption"
+                item_changed = False
+                try:
+                    progress(f"{label}: {index}/{len(targets)} {image_path.name}", current=index - 1, total=len(targets))
+                    if operation == "retry_failed":
+                        progress(f"{image_path.name}: retrying previous {effective_operation} failure.")
+                    if effective_operation == "text":
+                        failure_task = "caption"
+                        prepare_task("caption")
+                        caption_text = generate_plain_caption(settings, image_path)
+                        target["original_path"].write_text(caption_text, encoding="utf-8")
+                        item_changed = True
+                    elif effective_operation == "json_text":
+                        failure_task = "caption"
+                        source_text = self.read_text_file_if_exists(target["original_path"])
+                        if not source_text:
+                            raise AutoCaptionError(f"No source text caption found for {image_path.name}.")
+                        prepare_task("caption")
+                        caption = generate_json_from_text(settings, source_text, progress=progress)
+                        store.save_caption(image_path, caption)
+                        item_changed = True
+                        if settings.add_bboxes_after_json:
+                            failure_task = "bbox"
+                            prepare_task("bbox")
+                            caption, attempted, added, reasons = add_bboxes_to_caption(
+                                settings,
+                                image_path,
+                                caption,
+                                progress=progress,
+                            )
+                            store.save_caption(image_path, caption)
+                            record_bbox_result(image_path.name, attempted, added, reasons)
+                    elif effective_operation == "json_image":
+                        failure_task = "caption"
+                        prepare_task("caption")
+                        caption = generate_json_from_image(settings, image_path, progress=progress)
+                        store.save_caption(image_path, caption)
+                        item_changed = True
+                        if settings.add_bboxes_after_json:
+                            failure_task = "bbox"
+                            prepare_task("bbox")
+                            caption, attempted, added, reasons = add_bboxes_to_caption(
+                                settings,
+                                image_path,
+                                caption,
+                                progress=progress,
+                            )
+                            store.save_caption(image_path, caption)
+                            record_bbox_result(image_path.name, attempted, added, reasons)
+                    elif effective_operation == "bboxes":
+                        failure_task = "bbox"
+                        if not target["caption_path"].exists() or not target["caption_path"].read_text(encoding="utf-8-sig").strip():
+                            raise AutoCaptionError(f"No structured caption found for {image_path.name}.")
+                        caption, message = store.load_caption(image_path)
+                        if message and "Could not parse" in message:
+                            raise AutoCaptionError(message)
+                        prepare_task("bbox")
+                        caption, attempted, added, reasons = add_bboxes_to_caption(
+                            settings,
+                            image_path,
+                            caption,
+                            progress=progress,
+                        )
+                        store.save_caption(image_path, caption)
+                        item_changed = True
+                        record_bbox_result(image_path.name, attempted, added, reasons)
+                    else:
+                        raise AutoCaptionError(f"Unknown auto-captioning operation: {effective_operation}")
+                    if store.clear_failure_marker(image_path):
+                        item_changed = True
+                    ok += 1
+                    if item_changed:
+                        changed += 1
+                except AiJobCanceled:
+                    canceled = True
+                    progress(f"Canceled {label} after {ok + failed}/{len(targets)} image(s).", current=ok + failed, total=len(targets))
+                    break
+                except Exception as exc:
+                    failed += 1
+                    error = f"{image_path.name}: {exc}"
+                    try:
+                        store.save_failure_marker(
+                            image_path,
+                            build_failure_marker(image_path, target, effective_operation, failure_task, exc),
+                        )
+                        item_changed = True
+                    except OSError as marker_exc:
+                        error += f" (also could not write failure marker: {marker_exc})"
+                    errors.append(error)
+                    progress(error)
+                    if item_changed:
+                        changed += 1
+                progress(current=index, total=len(targets))
+        finally:
+            if settings.stop_server_after_job and managed_process is not None:
+                progress("Stopping auto-started server...")
+                stop_server_process(managed_process)
+                managed_process = None
+                managed_command = None
+                managed_phase = None
+
+        self.ai_queue.put(
+            {
+                "type": "done",
+                "label": label,
+                "total": len(targets),
+                "ok": ok,
+                "failed": failed,
+                "errors": errors,
+                "changed": changed,
+                "canceled": canceled,
+                "bbox_attempted": bbox_attempted_total,
+                "bbox_written": bbox_written_total,
+                "bbox_reasons": bbox_reason_totals,
+                "snapshot": snapshot,
+                "server_process": managed_process,
+                "server_command": managed_command,
+                "server_phase": managed_phase,
+            }
+        )
+
+    def poll_ai_queue(self) -> None:
+        final_message: str | None = None
+        while True:
+            try:
+                event = self.ai_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event.get("type") == "progress":
+                if "message" in event:
+                    self.status_var.set(str(event.get("message", "")))
+                if "current" in event and "total" in event:
+                    self.update_ai_progress(
+                        str(event.get("label", "Auto-captioning")),
+                        int(event.get("current", 0)),
+                        int(event.get("total", 1)),
+                    )
+            elif event.get("type") == "done":
+                self.ai_server_process = event.get("server_process")
+                self.ai_server_command = event.get("server_command")
+                self.ai_server_phase = event.get("server_phase")
+                changed = int(event.get("changed", 0))
+                if changed:
+                    self.ai_undo_stack.append(event["snapshot"])
+                ok = int(event.get("ok", 0))
+                failed = int(event.get("failed", 0))
+                total = int(event.get("total", ok + failed))
+                canceled = bool(event.get("canceled", False))
+                errors = [str(error) for error in event.get("errors", [])]
+                bbox_attempted = int(event.get("bbox_attempted", 0))
+                bbox_written = int(event.get("bbox_written", 0))
+                bbox_reasons = event.get("bbox_reasons", {})
+                bbox_summary = ""
+                if bbox_attempted:
+                    reason_summary = ""
+                    if isinstance(bbox_reasons, dict) and bbox_reasons:
+                        parts = [f"{reason}={count}" for reason, count in sorted(bbox_reasons.items())]
+                        reason_summary = " Reasons: " + "; ".join(parts) + "."
+                    bbox_summary = (
+                        f" BBoxes: targets={bbox_attempted}, written={bbox_written}, "
+                        f"skipped={bbox_attempted - bbox_written}.{reason_summary}"
+                    )
+                if errors:
+                    first_error = errors[0]
+                    final_message = f"Finished {event['label']}: ok={ok}, failed={failed}.{bbox_summary} First error: {first_error}"
+                    details = "\n".join(errors[:10])
+                    if len(errors) > 10:
+                        details += f"\n... plus {len(errors) - 10} more"
+                    messagebox.showerror("Auto-captioning failed", details)
+                elif canceled:
+                    final_message = f"Canceled {event['label']}: ok={ok}, failed={failed}.{bbox_summary}"
+                else:
+                    final_message = f"Finished {event['label']}: ok={ok}, failed={failed}.{bbox_summary}"
+                self.update_ai_progress(str(event["label"]), ok + failed, total)
+
+        if self.ai_worker is not None and self.ai_worker.is_alive():
+            self.after(100, self.poll_ai_queue)
+            return
+
+        self.set_ai_controls_running(False)
+        if final_message:
+            self.refresh_after_ai_job(final_message)
+        self.ai_worker = None
+        self.ai_cancel_event = None
+
+    def refresh_after_ai_job(self, message: str) -> None:
+        selected_paths = self.current_image_selection_paths()
+        self.apply_image_sort(preserve_current=True)
+        self.populate_image_list()
+        self.populate_image_selection(selected_paths=selected_paths)
+        if 0 <= self.current_index < len(self.images):
+            self.load_image_at(self.current_index, preserve_selection=True, skip_save=True, force_reload=True)
+        elif not self.images:
+            self.clear_loaded_image(f"{message} No images match {self.image_sort_var.get()}.")
+            return
+        self.status_var.set(message)
+
     def mark_dirty(self, immediate: bool = False) -> None:
         if self.loading_form:
             return
@@ -1411,6 +2859,7 @@ class CaptionEditorApp(tk.Tk):
             self.original_autosave_job = None
         if self.store is None or self.current_index < 0 or self.current_index >= len(self.images):
             return
+        selected_paths = self.current_image_selection_paths()
         self.sync_caption_from_form()
         image_path = self.images[self.current_index]
         saved_names: list[str] = []
@@ -1425,7 +2874,7 @@ class CaptionEditorApp(tk.Tk):
             return
         self.dirty = False
         self.populate_image_list()
-        self.populate_image_selection()
+        self.populate_image_selection(selected_paths=selected_paths)
         self.status_var.set(f"Saved {', '.join(saved_names)} at {time.strftime('%H:%M:%S')}")
 
     def copy_current_image_to_edit(self) -> None:
@@ -1457,6 +2906,11 @@ class CaptionEditorApp(tk.Tk):
             index = self.images.index(current_path)
             self.current_index = -1
             self.load_image_at(index)
+        elif self.images:
+            self.current_index = -1
+            self.load_image_at(0)
+        else:
+            self.clear_loaded_image(f"No images match {self.image_sort_var.get()}.")
 
     def on_original_extension_changed(self, _event: tk.Event) -> None:
         try:
@@ -1470,9 +2924,10 @@ class CaptionEditorApp(tk.Tk):
             extension = self.selected_original_extension()
             self.clear_original_text("Original: none" if extension is None else f"Original: {extension}")
         if self.image_sort_var.get() == IMAGE_SORT_ORIGINAL_MISSING:
+            selected_paths = self.current_image_selection_paths()
             self.apply_image_sort(preserve_current=True)
             self.populate_image_list()
-            self.populate_image_selection()
+            self.populate_image_selection(selected_paths=selected_paths)
 
     def next_image(self) -> None:
         self.load_image_at(min(self.current_index + 1, len(self.images) - 1))
@@ -1961,6 +3416,9 @@ class CaptionEditorApp(tk.Tk):
 
     def on_close(self) -> None:
         self.save_current()
+        if self.ai_server_process is not None:
+            stop_server_process(self.ai_server_process)
+            self.ai_server_process = None
         self.destroy()
 
 

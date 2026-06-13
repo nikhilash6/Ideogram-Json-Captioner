@@ -1,0 +1,86 @@
+{
+  "profiles": [
+    {
+      "id": "hauhaucs-qwen35-9b-aggressive-q6k",
+      "label": "Download: Qwen3.5-9B Uncensored HauhauCS Aggressive Q6_K (7GB)",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "hauhaucs-qwen35-9b",
+      "hf_repo": "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive",
+      "model_filename": "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf",
+      "mmproj_filename": "mmproj-Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16.gguf"
+    },
+    {
+      "id": "hauhaucs-gemma4-26b-balanced-q4km",
+      "label": "Download: Gemma4-26B A4B Uncensored HauhauCS-Balanced Q4_K_M (17GB)",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "gemma4-26b-balanced",
+      "hf_repo": "HauhauCS/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced",
+      "model_filename": "Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
+      "mmproj_filename": "mmproj-Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-f16.gguf"
+    },
+    {
+      "id": "huihui-qwen3vl-30b-abliterated-i1-q4ks",
+      "label": "Download: Huihui Qwen3-VL 30B abliterated i1 Q4_K_S (17GB)",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "huihui-qwen3vl-30b",
+      "hf_repo": "mradermacher/Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated-i1-GGUF",
+      "mmproj_repo": "mradermacher/Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated-GGUF",
+      "model_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.i1-Q4_K_S.gguf",
+      "mmproj_filename": "Huihui-Qwen3-VL-30B-A3B-Instruct-abliterated.mmproj-f16.gguf"
+    },
+    {
+      "id": "davidau-qwen36-27b-heretic-q6k",
+      "label": "Download: DavidAU Qwen3.6 27B Heretic Q6_K (22GB)",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "davidau-qwen36-27b-heretic",
+      "hf_repo": "DavidAU/Qwen3.6-27B-Heretic-Uncensored-FINETUNE-NEO-CODE-Di-IMatrix-MAX-GGUF",
+      "model_filename": "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q6_K.gguf",
+      "mmproj_filename": "mmproj-F16.gguf"
+    },
+    {
+      "id": "unsloth-qwen25vl-7b-q4",
+      "label": "Download: Qwen2.5-VL 7B Q4",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "qwen25vl",
+      "hf_repo": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+      "model_filename": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
+      "mmproj_filename": "mmproj-BF16.gguf"
+    },
+    {
+      "id": "unsloth-qwen3vl-30b-q4",
+      "label": "Download: Unsloth Qwen3-VL 30B Q4",
+      "tasks": ["caption", "bbox"],
+      "kind": "hf",
+      "api_model": "unsloth-qwen3vl-30b",
+      "hf_repo": "unsloth/Qwen3-VL-30B-A3B-Instruct-GGUF",
+      "model_filename": "Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf",
+      "mmproj_filename": "mmproj-BF16.gguf"
+    },
+    {
+      "id": "local-model",
+      "label": "Existing server alias: local-model",
+      "tasks": ["caption", "bbox"],
+      "kind": "server",
+      "api_model": "local-model"
+    },
+    {
+      "id": "server-qwen3vl",
+      "label": "Existing server alias: qwen3vl",
+      "tasks": ["caption", "bbox"],
+      "kind": "server",
+      "api_model": "qwen3vl"
+    },
+    {
+      "id": "server-gemma-vl",
+      "label": "Existing server alias: gemma-vl",
+      "tasks": ["caption"],
+      "kind": "server",
+      "api_model": "gemma-vl"
+    }
+  ]
+}

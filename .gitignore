@@ -22,6 +22,11 @@ dist/
 # Local configuration
 .env
 .env.*
+captioner_settings.json
+captioner_model_profiles.json
+captioner_prompts/
+models/
+server_logs/
 
 # Editor and OS files
 .idea/

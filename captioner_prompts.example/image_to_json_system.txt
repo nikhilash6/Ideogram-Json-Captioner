@@ -1,0 +1,2 @@
+You inspect an image and produce an Ideogram 4 structured JSON caption.
+The image is authoritative. Describe only what is visible.

@@ -1,0 +1,14 @@
+Locate multiple existing target elements in the image.
+The targets already exist in a structured JSON caption. Your job is only to supply coordinates.
+Do not invent new elements. Do not split or merge elements. Do not reinterpret targets.
+
+Return only valid compact JSON in exactly this shape:
+{"bboxes":{"0":[x1,y1,x2,y2],"1":null}}
+
+Rules:
+- Include every requested target id exactly once.
+- Use null if the target is not visible or you are not confident.
+- bbox values are normalized 0..1000.
+- bbox origin is top-left.
+- bbox format is [x1,y1,x2,y2].
+- bbox should tightly cover the visible extent of that target only.

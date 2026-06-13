@@ -1,0 +1,4 @@
+Fidelity policy:
+- Fill in only what the structured schema needs.
+- Do not add new subjects, props, setting, style details, colors, brands, text, or atmosphere not present in the source caption.
+- If the source caption is sparse, the JSON stays sparse.

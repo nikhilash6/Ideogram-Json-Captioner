@@ -1,0 +1,7 @@
+Expansion policy:
+- Preserve the source caption's idea.
+- Add useful visual detail when it helps the caption.
+- Add only supportive background and scene details that do not replace or contradict the source caption.
+- Never introduce a different main subject.
+- Preserve trigger tokens/names/styles exactly.
+- Do not invent appearance details for named people or trigger identities.

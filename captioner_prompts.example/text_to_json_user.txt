@@ -1,0 +1,4 @@
+Existing vetted caption:
+{caption}
+
+Convert this caption into Ideogram 4 structured JSON.

@@ -1,0 +1,2 @@
+Write a detailed but clean text-to-image caption for this image. Keep it useful
+for recreating the image, but avoid unsupported proper names or speculation.

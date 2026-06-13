@@ -1,0 +1,8 @@
+Supporting structured JSON context:
+{context_json}
+
+Targets to locate:
+{targets_json}
+
+Return only:
+{{"bboxes":{{"0":[x1,y1,x2,y2],"1":null}}}}

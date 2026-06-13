@@ -1,0 +1,33 @@
+Return exactly one compact valid JSON object. No markdown. No commentary.
+
+Schema:
+{
+  "high_level_description": "...",
+  "style_description": {
+    "aesthetics": "...",
+    "lighting": "...",
+    "photo": "...",
+    "medium": "photograph"
+  },
+  "compositional_deconstruction": {
+    "background": "...",
+    "elements": [
+      {"type": "obj", "desc": "..."},
+      {"type": "text", "text": "...", "desc": "..."}
+    ]
+  }
+}
+
+Rules:
+- Include high_level_description, style_description, and compositional_deconstruction.
+- compositional_deconstruction must contain background first, then elements.
+- Use "photo" for photographic images, or replace it with "art_style" for non-photo artwork.
+- Use exactly one of "photo" or "art_style".
+- Do not include bbox values. Bboxes are added in a separate pass.
+- Do not include color_palette fields.
+- type is "obj" for normal subjects/objects and "text" only for literal visible text.
+- Text elements must preserve the literal visible text exactly.
+- A coherent subject is one element; do not split people, vehicles, plants, buildings, or products into parts.
+- Put ground, sky, walls, distant scenery, and ambient environment into background.
+- Put people, animals, vehicles, products, furniture, props, signs, and visible text into elements.
+- Keep trigger tokens, names, identifiers, and stylized spelling exactly.

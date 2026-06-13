@@ -62,6 +62,31 @@ class StoreTests(unittest.TestCase):
             self.assertIn("style_description", saved)
             self.assertIn("compositional_deconstruction", saved)
 
+    def test_failure_marker_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            image = folder / "sample.jpg"
+            image.write_bytes(b"x")
+            store = CaptionStore(folder, ".json")
+
+            path = store.save_failure_marker(
+                image,
+                {
+                    "operation": "json_image",
+                    "reason": "caption_json_parse_failed",
+                    "error": "Could not parse model JSON",
+                },
+            )
+
+            self.assertEqual(path, folder / "sample.caption_failed.json")
+            self.assertTrue(store.has_failure_marker(image))
+            marker = store.load_failure_marker(image)
+            self.assertIsNotNone(marker)
+            self.assertEqual(marker["operation"], "json_image")
+            self.assertTrue(store.clear_failure_marker(image))
+            self.assertFalse(store.has_failure_marker(image))
+            self.assertFalse(store.clear_failure_marker(image))
+
     def test_edit_folder_is_not_listed_as_source_images(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

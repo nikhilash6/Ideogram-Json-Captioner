@@ -23,6 +23,34 @@ class CaptionStore:
     def caption_path(self, image_path: Path) -> Path:
         return image_path.with_suffix(self.extension)
 
+    def failure_path(self, image_path: Path) -> Path:
+        return image_path.with_suffix(".caption_failed.json")
+
+    def load_failure_marker(self, image_path: Path) -> dict[str, Any] | None:
+        path = self.failure_path(image_path)
+        if not path.exists():
+            return None
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return loaded if isinstance(loaded, dict) else None
+
+    def has_failure_marker(self, image_path: Path) -> bool:
+        return self.failure_path(image_path).exists()
+
+    def save_failure_marker(self, image_path: Path, marker: dict[str, Any]) -> Path:
+        path = self.failure_path(image_path)
+        path.write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def clear_failure_marker(self, image_path: Path) -> bool:
+        path = self.failure_path(image_path)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
     def load_caption(self, image_path: Path) -> tuple[dict[str, Any], str | None]:
         caption_path = self.caption_path(image_path)
         if not caption_path.exists():
