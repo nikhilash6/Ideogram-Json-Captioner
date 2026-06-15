@@ -1,0 +1,10 @@
+User edit instructions:
+{instructions}
+
+Existing sidecar caption:
+{source_caption}
+
+Current structured JSON:
+{caption_json}
+
+Revise the structured JSON according to the instructions.

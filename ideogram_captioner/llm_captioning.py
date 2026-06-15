@@ -76,6 +76,13 @@ class ModelAssets:
     mmproj_path: Path | None = None
 
 
+DEFAULT_JSON_REFINE_INSTRUCTIONS = """
+Improve the existing structured JSON caption while preserving the image's actual content.
+Add useful detail where the current JSON is vague, but do not invent subjects, text, brands,
+or identities that are not visible in the image.
+""".strip()
+
+
 def app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -321,6 +328,7 @@ class CaptioningSettings:
     creative_json: bool = True
     disable_thinking: bool = True
     vision_image_format: str = "auto"
+    json_refine_instructions: str = DEFAULT_JSON_REFINE_INSTRUCTIONS
 
     max_tokens_caption: int = 2000
     max_tokens_json: int = 12000
@@ -1074,6 +1082,16 @@ Schema:
   }
 }
 
+Field guidance:
+- high_level_description: one or two sentences summarizing the whole image.
+- aesthetics: concise visual style keywords, e.g. "moody, cinematic, desaturated" or "warm, playful, vibrant".
+- lighting: concrete light quality, source, and shadow behavior, e.g. "golden hour, rim light, dramatic shadows" or "bright afternoon sunlight, long soft shadows".
+- photo: camera, lens, viewpoint, focus, and photographic traits for photos, e.g. "35mm, f/1.4, bokeh", "shallow depth of field, eye-level, 85mm lens", or "wide angle, f/8, long exposure".
+- medium: use a compact medium label such as "photograph", "illustration", "3d_render", "painting", or "graphic_design".
+- art_style: style and medium traits for non-photo captions, e.g. "flat vector illustration, bold outlines" or "flat vector design, generous whitespace, sans-serif typography".
+- background: describe the environment, setting, distant scenery, surfaces, and atmosphere.
+- elements desc: describe each subject/object with its visible appearance, clothing/materials, pose/action, and important props.
+
 Rules:
 - Include high_level_description, style_description, and compositional_deconstruction.
 - compositional_deconstruction must contain background first, then elements.
@@ -1109,6 +1127,66 @@ The image is authoritative. Describe only what is visible.
 IMAGE_TO_JSON_USER = """
 Create an Ideogram 4 structured JSON caption for this image.
 Do not reference any existing sidecar caption.
+""".strip()
+
+JSON_REFINE_SYSTEM = """
+You revise an existing Ideogram 4 structured JSON caption for an image dataset.
+Use the image as the visual authority, the current JSON as the structure to improve,
+the sidecar caption as supporting context, and the user's edit instructions as the task.
+
+Return exactly one compact valid JSON object. No markdown. No commentary.
+
+Schema:
+{
+  "high_level_description": "...",
+  "style_description": {
+    "aesthetics": "...",
+    "lighting": "...",
+    "photo": "...",
+    "medium": "photograph"
+  },
+  "compositional_deconstruction": {
+    "background": "...",
+    "elements": [
+      {"type": "obj", "bbox": [y1,x1,y2,x2], "desc": "..."},
+      {"type": "text", "bbox": [y1,x1,y2,x2], "text": "...", "desc": "..."}
+    ]
+  }
+}
+
+Field guidance:
+- high_level_description: one or two sentences summarizing the whole image.
+- aesthetics: concise visual style keywords, e.g. "moody, cinematic, desaturated" or "warm, playful, vibrant".
+- lighting: concrete light quality, source, and shadow behavior, e.g. "golden hour, rim light, dramatic shadows" or "bright afternoon sunlight, long soft shadows".
+- photo: camera, lens, viewpoint, focus, and photographic traits for photos, e.g. "35mm, f/1.4, bokeh", "shallow depth of field, eye-level, 85mm lens", or "wide angle, f/8, long exposure".
+- medium: use a compact medium label such as "photograph", "illustration", "3d_render", "painting", or "graphic_design".
+- art_style: style and medium traits for non-photo captions, e.g. "flat vector illustration, bold outlines" or "flat vector design, generous whitespace, sans-serif typography".
+- background: describe the environment, setting, distant scenery, surfaces, and atmosphere.
+- elements desc: describe each subject/object with its visible appearance, clothing/materials, pose/action, and important props.
+- bbox: when present, use [y_min,x_min,y_max,x_max] normalized 0..1000 with origin at top-left.
+
+Rules:
+- Preserve trigger tokens, names, identifiers, and stylized spelling exactly.
+- Preserve literal visible text exactly.
+- Preserve existing bbox values for unchanged elements. Do not invent bboxes for new elements.
+- Do not remove real visible elements unless the user's instructions explicitly say to.
+- A coherent subject is one element; do not split people, vehicles, plants, buildings, or products into parts.
+- Put people, animals, vehicles, products, furniture, props, signs, and visible text into elements.
+- Put ground, sky, walls, distant scenery, and ambient environment into background.
+- For photographic images use "photo"; for non-photo artwork use "art_style". Use exactly one of those keys.
+""".strip()
+
+JSON_REFINE_USER = """
+User edit instructions:
+{instructions}
+
+Existing sidecar caption:
+{source_caption}
+
+Current structured JSON:
+{caption_json}
+
+Revise the structured JSON according to the instructions.
 """.strip()
 
 BATCH_GROUND_SYSTEM = """
@@ -1150,6 +1228,8 @@ DEFAULT_PROMPT_TEXTS: dict[str, str] = {
     "text_to_json_user": TEXT_TO_JSON_USER,
     "image_to_json_system": IMAGE_TO_JSON_SYSTEM,
     "image_to_json_user": IMAGE_TO_JSON_USER,
+    "json_refine_system": JSON_REFINE_SYSTEM,
+    "json_refine_user": JSON_REFINE_USER,
     "bbox_system": BATCH_GROUND_SYSTEM,
     "bbox_user": BATCH_GROUND_USER,
 }
@@ -1279,6 +1359,62 @@ def generate_json_from_image(
         progress=progress,
     )
     return normalize_caption(parsed)
+
+
+def _preserve_missing_refined_bboxes(original: dict[str, Any], refined: dict[str, Any]) -> dict[str, Any]:
+    original = normalize_caption(original)
+    refined = normalize_caption(refined)
+    original_elements = original.get("compositional_deconstruction", {}).get("elements", [])
+    refined_elements = refined.get("compositional_deconstruction", {}).get("elements", [])
+    for index, refined_element in enumerate(refined_elements):
+        if normalize_bbox(refined_element.get("bbox")) is not None or index >= len(original_elements):
+            continue
+        original_element = original_elements[index]
+        if refined_element.get("type") != original_element.get("type"):
+            continue
+        bbox = normalize_bbox(original_element.get("bbox"))
+        if bbox is not None:
+            refined_element["bbox"] = bbox
+    return normalize_caption(refined)
+
+
+def generate_json_refinement(
+    settings: CaptioningSettings,
+    image_path: Path,
+    caption: dict[str, Any],
+    source_caption: str,
+    instructions: str,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    instructions = instructions.strip()
+    if not instructions:
+        raise AutoCaptionError("No JSON refinement instructions were provided.")
+    config = runtime_config_for_task(settings, "caption")
+    prompts = load_prompts()
+    current_caption = normalize_caption(caption)
+    raw = chat_vision(
+        settings=settings,
+        model=config.api_model,
+        image_path=image_path,
+        system=prompts["json_refine_system"],
+        user=format_prompt(
+            prompts["json_refine_user"],
+            instructions=instructions,
+            source_caption=source_caption.strip() or "(none)",
+            caption_json=json.dumps(current_caption, ensure_ascii=False, indent=2),
+        ),
+        max_tokens=settings.max_tokens_json,
+        temperature=0.0,
+    )
+    parsed = parse_json_with_repair(
+        settings=settings,
+        task="caption",
+        raw_output=raw,
+        expected="a refined Ideogram 4 structured caption JSON object",
+        max_tokens=settings.max_tokens_json,
+        progress=progress,
+    )
+    return _preserve_missing_refined_bboxes(current_caption, parsed)
 
 
 def bbox_xyxy_to_yxyx(bbox: Any) -> list[int] | None:

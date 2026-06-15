@@ -20,7 +20,8 @@ Ollama-compatible server.
 - Keep editable original captions, such as `.txt` or `.original`, separate from
   structured JSON output.
 - Generate text captions, JSON captions from text, JSON captions from images,
-  and bounding boxes with a local or existing vision-language model server.
+  JSON refinements, and bounding boxes with a local or existing
+  vision-language model server.
 - Batch auto-caption selected images, retry failed captions, and undo the last
   auto-captioning job.
 - Sort and filter the image list by name, modified date, missing captions, or
@@ -102,6 +103,9 @@ The right-side `Auto Captioning` buttons do the following:
 - `Text Caption`: creates or replaces the plain original-caption sidecar.
 - `JSON from Text`: converts the original caption into Ideogram JSON.
 - `JSON from Image`: creates Ideogram JSON directly from the image.
+- `Refine JSON`: revises existing structured JSON from the image, the current
+  JSON, the original caption sidecar, and custom instructions entered at run
+  time.
 - `Add/redo BBoxes`: localizes existing JSON elements with the selected VLM.
 - `Retry Failed`: reruns images that have failed auto-captioning markers.
 - `Clear Failed`: removes failed markers without rerunning the model.
@@ -169,6 +173,7 @@ to the built-in defaults.
 Keep these placeholders if you edit the matching prompt:
 
 - `text_to_json_user.txt`: `{caption}`
+- `json_refine_user.txt`: `{instructions}`, `{source_caption}`, `{caption_json}`
 - `bbox_user.txt`: `{context_json}`, `{targets_json}`
 
 `creative_directive.txt` or `faithful_directive.txt` is appended to the JSON

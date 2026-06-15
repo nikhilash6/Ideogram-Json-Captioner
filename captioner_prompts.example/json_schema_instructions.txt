@@ -18,6 +18,16 @@ Schema:
   }
 }
 
+Field guidance:
+- high_level_description: one or two sentences summarizing the whole image.
+- aesthetics: concise visual style keywords, e.g. "moody, cinematic, desaturated" or "warm, playful, vibrant".
+- lighting: concrete light quality, source, and shadow behavior, e.g. "golden hour, rim light, dramatic shadows" or "bright afternoon sunlight, long soft shadows".
+- photo: camera, lens, viewpoint, focus, and photographic traits for photos, e.g. "35mm, f/1.4, bokeh", "shallow depth of field, eye-level, 85mm lens", or "wide angle, f/8, long exposure".
+- medium: use a compact medium label such as "photograph", "illustration", "3d_render", "painting", or "graphic_design".
+- art_style: style and medium traits for non-photo captions, e.g. "flat vector illustration, bold outlines" or "flat vector design, generous whitespace, sans-serif typography".
+- background: describe the environment, setting, distant scenery, surfaces, and atmosphere.
+- elements desc: describe each subject/object with its visible appearance, clothing/materials, pose/action, and important props.
+
 Rules:
 - Include high_level_description, style_description, and compositional_deconstruction.
 - compositional_deconstruction must contain background first, then elements.

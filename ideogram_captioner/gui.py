@@ -41,6 +41,7 @@ from .llm_captioning import (
     find_llama_server,
     format_server_command,
     generate_json_from_image,
+    generate_json_refinement,
     generate_json_from_text,
     generate_plain_caption,
     is_server_ready,
@@ -261,16 +262,16 @@ class CaptioningPreferencesDialog(tk.Toplevel):
         notebook = ttk.Notebook(self)
         notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
-        connection = ttk.Frame(notebook, padding=10)
-        models = ttk.Frame(notebook, padding=10)
-        pipeline = ttk.Frame(notebook, padding=10)
+        connection = ScrollFrame(notebook)
+        models = ScrollFrame(notebook)
+        pipeline = ScrollFrame(notebook)
         notebook.add(connection, text="Connection")
         notebook.add(models, text="Models")
         notebook.add(pipeline, text="Pipeline")
 
-        self._build_connection_tab(connection)
-        self._build_models_tab(models)
-        self._build_pipeline_tab(pipeline)
+        self._build_connection_tab(connection.interior)
+        self._build_models_tab(models.interior)
+        self._build_pipeline_tab(pipeline.interior)
 
         buttons = ttk.Frame(self, padding=(10, 0, 10, 10))
         buttons.grid(row=1, column=0, sticky="ew")
@@ -487,8 +488,7 @@ class CaptioningPreferencesDialog(tk.Toplevel):
     def _open_prompts_file(self) -> None:
         path = default_prompts_path()
         try:
-            if not path.exists():
-                write_default_prompts(path)
+            write_default_prompts(path)
             if hasattr(os, "startfile"):
                 os.startfile(path)  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
@@ -678,6 +678,61 @@ class CaptioningPreferencesDialog(tk.Toplevel):
             return
 
         self.result = settings
+        self.destroy()
+
+
+class JsonRefineInstructionsDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, instructions: str) -> None:
+        super().__init__(parent)
+        self.title("Refine JSON Instructions")
+        self.transient(parent)
+        self.result: str | None = None
+
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        ttk.Label(self, text="Instructions for revising the current JSON").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=10,
+            pady=(10, 4),
+        )
+        self.text = tk.Text(
+            self,
+            height=10,
+            width=88,
+            wrap="word",
+            bg="#10131a",
+            fg="#f5f7fb",
+            insertbackground="#ffffff",
+            relief="flat",
+            padx=8,
+            pady=8,
+            undo=True,
+        )
+        self.text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.text.insert("1.0", instructions.strip())
+
+        buttons = ttk.Frame(self, padding=(10, 0, 10, 10))
+        buttons.grid(row=2, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+        ttk.Button(buttons, text="Cancel", command=self.destroy).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(buttons, text="Run", command=self._accept, style="Accent.TButton").grid(row=0, column=2)
+
+        self.bind("<Control-Return>", lambda _event: self._accept())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.grab_set()
+        self.text.focus_set()
+        self.update_idletasks()
+        self.geometry(f"760x360+{parent.winfo_rootx() + 120}+{parent.winfo_rooty() + 120}")
+
+    def _accept(self) -> None:
+        instructions = self.text.get("1.0", "end").strip()
+        if not instructions:
+            messagebox.showerror("Missing instructions", "Enter instructions for the JSON refinement pass.")
+            return
+        self.result = instructions
         self.destroy()
 
 
@@ -1128,11 +1183,11 @@ class CaptionEditorApp(tk.Tk):
             ("Text Caption", self.auto_generate_text_caption),
             ("JSON from Text", self.auto_generate_json_from_text),
             ("JSON from Image", self.auto_generate_json_from_image),
+            ("Refine JSON", self.auto_refine_json),
             ("Add/redo BBoxes", self.auto_generate_bboxes),
             ("Retry Failed", self.retry_failed_captions),
             ("Clear Failed", self.clear_failed_markers),
             ("Undo AI", self.undo_last_ai_job),
-            ("Prefs", self.open_captioning_preferences),
         )
         self.ai_buttons = []
         for index, (label, command) in enumerate(buttons):
@@ -2476,6 +2531,20 @@ class CaptionEditorApp(tk.Tk):
     def auto_generate_json_from_image(self) -> None:
         self.start_ai_job("json_image", "JSON captions from image")
 
+    def auto_refine_json(self) -> None:
+        self.save_current()
+        dialog = JsonRefineInstructionsDialog(self, self.captioning_settings.json_refine_instructions)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self.captioning_settings.json_refine_instructions = dialog.result
+        try:
+            save_settings(self.captioning_settings)
+        except OSError as exc:
+            messagebox.showerror("Preferences not saved", str(exc))
+            return
+        self.start_ai_job("json_refine", "JSON refinement")
+
     def auto_generate_bboxes(self) -> None:
         self.start_ai_job("bboxes", "bboxes")
 
@@ -2886,7 +2955,7 @@ class CaptionEditorApp(tk.Tk):
         def retry_operation_for_marker(image_path: Path) -> str:
             marker = store.load_failure_marker(image_path)
             operation_from_marker = str(marker.get("operation", "")).strip() if marker else ""
-            if operation_from_marker in {"text", "json_text", "json_image", "bboxes"}:
+            if operation_from_marker in {"text", "json_text", "json_image", "json_refine", "bboxes"}:
                 return operation_from_marker
             return "json_image"
 
@@ -2947,6 +3016,25 @@ class CaptionEditorApp(tk.Tk):
                             )
                             store.save_caption(image_path, caption)
                             record_bbox_result(image_path.name, attempted, added, reasons)
+                    elif effective_operation == "json_refine":
+                        failure_task = "caption"
+                        if not target["caption_path"].exists() or not target["caption_path"].read_text(encoding="utf-8-sig").strip():
+                            raise AutoCaptionError(f"No structured caption found for {image_path.name}.")
+                        caption, message = store.load_caption(image_path)
+                        if message and "Could not parse" in message:
+                            raise AutoCaptionError(message)
+                        source_text = self.read_text_file_if_exists(target["original_path"])
+                        prepare_task("caption")
+                        caption = generate_json_refinement(
+                            settings,
+                            image_path,
+                            caption,
+                            source_text,
+                            settings.json_refine_instructions,
+                            progress=progress,
+                        )
+                        store.save_caption(image_path, caption)
+                        item_changed = True
                     elif effective_operation == "bboxes":
                         failure_task = "bbox"
                         if not target["caption_path"].exists() or not target["caption_path"].read_text(encoding="utf-8-sig").strip():

@@ -18,6 +18,7 @@ from ideogram_captioner.llm_captioning import (
     ensure_model_assets,
     extract_json,
     format_prompt,
+    generate_json_refinement,
     json_system_prompt,
     load_model_profiles,
     load_prompts,
@@ -222,6 +223,7 @@ class LlmCaptioningTests(unittest.TestCase):
 
         self.assertEqual(prompts["bbox_system"], "custom bbox system")
         self.assertIn("{targets_json}", prompts["bbox_user"])
+        self.assertIn("{instructions}", prompts["json_refine_user"])
         self.assertIn("plain_caption_system", prompts)
 
     def test_writes_default_prompt_folder(self):
@@ -231,6 +233,7 @@ class LlmCaptioningTests(unittest.TestCase):
 
             self.assertTrue((written / "bbox_user.txt").exists())
             self.assertTrue((written / "text_to_json_user.txt").exists())
+            self.assertTrue((written / "json_refine_user.txt").exists())
 
     def test_prompt_placeholder_errors_are_actionable(self):
         with self.assertRaises(AutoCaptionError):
@@ -244,6 +247,64 @@ class LlmCaptioningTests(unittest.TestCase):
         self.assertIn("Expansion policy", system)
         self.assertNotIn("{directive}", prompts["text_to_json_user"])
         self.assertNotIn("{directive}", prompts["image_to_json_user"])
+
+    def test_json_refinement_requires_instructions(self):
+        with self.assertRaises(AutoCaptionError):
+            generate_json_refinement(
+                CaptioningSettings(caption_model="vision-model"),
+                Path("sample.png"),
+                {"high_level_description": "A sign"},
+                "",
+                "",
+            )
+
+    def test_json_refinement_uses_image_context_and_preserves_missing_bboxes(self):
+        raw = json.dumps(
+            {
+                "high_level_description": "A woman seated beside a window.",
+                "style_description": {
+                    "aesthetics": "natural",
+                    "lighting": "window light",
+                    "photo": "portrait lens",
+                    "medium": "photograph",
+                },
+                "compositional_deconstruction": {
+                    "background": "room",
+                    "elements": [{"type": "obj", "desc": "A woman wearing a red jacket, seated in profile."}],
+                },
+            }
+        )
+        caption = {
+            "high_level_description": "A woman.",
+            "style_description": {
+                "aesthetics": "natural",
+                "lighting": "soft",
+                "photo": "",
+                "medium": "photograph",
+            },
+            "compositional_deconstruction": {
+                "background": "room",
+                "elements": [{"type": "obj", "bbox": [100, 200, 500, 700], "desc": "A woman."}],
+            },
+        }
+
+        with patch("ideogram_captioner.llm_captioning.chat_vision", return_value=raw) as chat:
+            refined = generate_json_refinement(
+                CaptioningSettings(caption_model="vision-model"),
+                Path("sample.png"),
+                caption,
+                "original sidecar caption",
+                "Add clothing and pose details to people.",
+            )
+
+        self.assertEqual(
+            refined["compositional_deconstruction"]["elements"][0]["bbox"],
+            [100, 200, 500, 700],
+        )
+        request = chat.call_args.kwargs["user"]
+        self.assertIn("Add clothing and pose details", request)
+        self.assertIn("original sidecar caption", request)
+        self.assertIn('"high_level_description": "A woman."', request)
 
     def test_custom_local_profile_uses_selected_files(self):
         with tempfile.TemporaryDirectory() as temp:
