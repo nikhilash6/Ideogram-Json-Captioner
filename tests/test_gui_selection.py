@@ -177,6 +177,32 @@ class GuiSelectionTests(unittest.TestCase):
                 )
             )
 
+    def test_json_caption_style_fields_infers_mode_and_medium(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            caption = folder / "sample.json"
+            caption.write_text(
+                '{"style_description":{"_mode":"art_style","medium":"painting","photo":"ignored","art_style":"oil"}}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(CaptionEditorApp.json_caption_style_fields(caption), ("art_style", "painting"))
+
+    def test_image_matches_style_filter_uses_json_caption(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            image = folder / "sample.png"
+            image.write_bytes(b"x")
+            image.with_suffix(".json").write_text(
+                '{"style_description":{"photo":"85mm lens","medium":"Photograph"}}',
+                encoding="utf-8",
+            )
+
+            self.assertTrue(CaptionEditorApp.image_matches_style_filter(image, ".json", "photo", "photograph"))
+            self.assertTrue(CaptionEditorApp.image_matches_style_filter(image, ".json", "", "photograph"))
+            self.assertFalse(CaptionEditorApp.image_matches_style_filter(image, ".json", "art_style", "photograph"))
+            self.assertFalse(CaptionEditorApp.image_matches_style_filter(image, ".json", "photo", "painting"))
+
 
 if __name__ == "__main__":
     unittest.main()
