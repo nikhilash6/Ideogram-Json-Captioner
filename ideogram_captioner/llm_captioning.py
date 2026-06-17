@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image
+from PIL import ExifTags, Image
 
 from .schema import normalize_bbox, normalize_caption
 
@@ -797,6 +797,186 @@ def image_to_data_url(path: Path, vision_image_format: str = "auto") -> str:
         return f"data:{mime};base64,{b64}"
 
 
+def _exif_tag_maps(exif: Image.Exif) -> list[dict[int, Any]]:
+    maps: list[dict[int, Any]] = [dict(exif)]
+    try:
+        exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+    except Exception:
+        exif_ifd = {}
+    if exif_ifd:
+        maps.append(dict(exif_ifd))
+    return maps
+
+
+def _first_exif_value(tag_maps: list[dict[int, Any]], *tags: int) -> Any:
+    for tag in tags:
+        for tag_map in tag_maps:
+            if tag in tag_map:
+                value = tag_map[tag]
+                if value is not None and value != "":
+                    return value
+    return None
+
+
+def _rational_float(value: Any) -> float | None:
+    try:
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            denominator = float(value[1])
+            if denominator == 0:
+                return None
+            return float(value[0]) / denominator
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _format_exif_decimal(value: float, digits: int = 1) -> str:
+    text = f"{value:.{digits}f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _format_exif_string(value: Any) -> str | None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value).strip()
+    return text or None
+
+
+def _format_f_stop(value: Any) -> str | None:
+    number = _rational_float(value)
+    if number is None or number <= 0:
+        return None
+    return f"f/{_format_exif_decimal(number, 1)}"
+
+
+def _format_focal_length(value: Any) -> str | None:
+    number = _rational_float(value)
+    if number is None or number <= 0:
+        return None
+    return f"{_format_exif_decimal(number, 1)}mm"
+
+
+def _format_exposure_time(value: Any) -> str | None:
+    seconds = _rational_float(value)
+    if seconds is None or seconds <= 0:
+        return None
+    if seconds < 1:
+        denominator = round(1 / seconds)
+        if denominator > 0 and abs(seconds - (1 / denominator)) < 0.0005:
+            return f"1/{denominator}s"
+    return f"{_format_exif_decimal(seconds, 3)}s"
+
+
+def _format_iso(value: Any) -> str | None:
+    if isinstance(value, (tuple, list)) and value:
+        value = value[0]
+    try:
+        iso = int(value)
+    except (TypeError, ValueError):
+        return _format_exif_string(value)
+    return str(iso) if iso > 0 else None
+
+
+def _format_exposure_bias(value: Any) -> str | None:
+    number = _rational_float(value)
+    if number is None:
+        return None
+    sign = "+" if number > 0 else ""
+    return f"{sign}{_format_exif_decimal(number, 2)} EV"
+
+
+def _mapped_exif_value(value: Any, names: dict[int, str]) -> str | None:
+    try:
+        return names.get(int(value)) or _format_exif_string(value)
+    except (TypeError, ValueError):
+        return _format_exif_string(value)
+
+
+def _format_flash(value: Any) -> str | None:
+    try:
+        flags = int(value)
+    except (TypeError, ValueError):
+        return _format_exif_string(value)
+    return "fired" if flags & 1 else "did not fire"
+
+
+def image_exif_context(image_path: Path) -> dict[str, str]:
+    try:
+        with Image.open(image_path) as image:
+            exif = image.getexif()
+    except Exception:
+        return {}
+    if not exif:
+        return {}
+
+    tag_maps = _exif_tag_maps(exif)
+    exposure_programs = {
+        0: "not defined",
+        1: "manual",
+        2: "normal program",
+        3: "aperture priority",
+        4: "shutter priority",
+        5: "creative program",
+        6: "action program",
+        7: "portrait mode",
+        8: "landscape mode",
+    }
+    metering_modes = {
+        0: "unknown",
+        1: "average",
+        2: "center-weighted average",
+        3: "spot",
+        4: "multi-spot",
+        5: "pattern",
+        6: "partial",
+        255: "other",
+    }
+    white_balance_modes = {0: "auto", 1: "manual"}
+    field_specs: tuple[tuple[str, Callable[[Any], str | None], tuple[int, ...]], ...] = (
+        ("camera_make", _format_exif_string, (int(ExifTags.Base.Make),)),
+        ("camera_model", _format_exif_string, (int(ExifTags.Base.Model),)),
+        ("lens_make", _format_exif_string, (int(ExifTags.Base.LensMake),)),
+        ("lens_model", _format_exif_string, (int(ExifTags.Base.LensModel),)),
+        ("f_stop", _format_f_stop, (int(ExifTags.Base.FNumber),)),
+        ("exposure_time", _format_exposure_time, (int(ExifTags.Base.ExposureTime),)),
+        ("iso", _format_iso, (int(ExifTags.Base.ISOSpeedRatings), 34855)),
+        ("focal_length", _format_focal_length, (int(ExifTags.Base.FocalLength),)),
+        ("exposure_bias", _format_exposure_bias, (int(ExifTags.Base.ExposureBiasValue),)),
+        (
+            "exposure_program",
+            lambda value: _mapped_exif_value(value, exposure_programs),
+            (int(ExifTags.Base.ExposureProgram),),
+        ),
+        ("metering_mode", lambda value: _mapped_exif_value(value, metering_modes), (int(ExifTags.Base.MeteringMode),)),
+        ("flash", _format_flash, (int(ExifTags.Base.Flash),)),
+        ("white_balance", lambda value: _mapped_exif_value(value, white_balance_modes), (int(ExifTags.Base.WhiteBalance),)),
+    )
+
+    context: dict[str, str] = {}
+    for key, formatter, tags in field_specs:
+        value = _first_exif_value(tag_maps, *tags)
+        if value is None:
+            continue
+        formatted = formatter(value)
+        if formatted:
+            context[key] = formatted
+    return context
+
+
+def append_image_exif_context(user_prompt: str, image_path: Path) -> str:
+    context = image_exif_context(image_path)
+    if not context:
+        return user_prompt
+    metadata_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join(
+        (
+            user_prompt.rstrip(),
+            "Image EXIF metadata, if useful for photographic style fields. Treat the image as authoritative:",
+            metadata_json,
+        )
+    )
+
+
 def extract_json(text: str) -> dict[str, Any]:
     raw_output = text
     text = text.strip()
@@ -1108,7 +1288,7 @@ Rules:
 """.strip()
 
 TEXT_TO_JSON_SYSTEM = """
-You convert an existing vetted sidecar caption into an Ideogram 4 structured JSON caption.
+You convert an existing vetted text caption into an Ideogram 4 structured JSON caption.
 The source caption is authoritative; organize it into the schema without recaptioning the image.
 """.strip()
 
@@ -1126,13 +1306,13 @@ The image is authoritative. Describe only what is visible.
 
 IMAGE_TO_JSON_USER = """
 Create an Ideogram 4 structured JSON caption for this image.
-Do not reference any existing sidecar caption.
+Do not reference any existing text caption.
 """.strip()
 
 JSON_REFINE_SYSTEM = """
 You revise an existing Ideogram 4 structured JSON caption for an image dataset.
 Use the image as the visual authority, the current JSON as the structure to improve,
-the sidecar caption as supporting context, and the user's edit instructions as the task.
+the text caption as supporting context, and the user's edit instructions as the task.
 
 Return exactly one compact valid JSON object. No markdown. No commentary.
 
@@ -1180,7 +1360,7 @@ JSON_REFINE_USER = """
 User edit instructions:
 {instructions}
 
-Existing sidecar caption:
+Existing text caption:
 {source_caption}
 
 Current structured JSON:
@@ -1346,7 +1526,10 @@ def generate_json_from_image(
         model=config.api_model,
         image_path=image_path,
         system=json_system_prompt(prompts, "image_to_json_system", settings),
-        user=format_prompt(prompts["image_to_json_user"], directive=""),
+        user=append_image_exif_context(
+            format_prompt(prompts["image_to_json_user"], directive=""),
+            image_path,
+        ),
         max_tokens=settings.max_tokens_json,
         temperature=0.0,
     )
@@ -1397,11 +1580,14 @@ def generate_json_refinement(
         model=config.api_model,
         image_path=image_path,
         system=prompts["json_refine_system"],
-        user=format_prompt(
-            prompts["json_refine_user"],
-            instructions=instructions,
-            source_caption=source_caption.strip() or "(none)",
-            caption_json=json.dumps(current_caption, ensure_ascii=False, indent=2),
+        user=append_image_exif_context(
+            format_prompt(
+                prompts["json_refine_user"],
+                instructions=instructions,
+                source_caption=source_caption.strip() or "(none)",
+                caption_json=json.dumps(current_caption, ensure_ascii=False, indent=2),
+            ),
+            image_path,
         ),
         max_tokens=settings.max_tokens_json,
         temperature=0.0,

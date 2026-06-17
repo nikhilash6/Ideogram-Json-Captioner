@@ -1,2 +1,2 @@
-You convert an existing vetted sidecar caption into an Ideogram 4 structured JSON caption.
+You convert an existing vetted text caption into an Ideogram 4 structured JSON caption.
 The source caption is authoritative; organize it into the schema without recaptioning the image.

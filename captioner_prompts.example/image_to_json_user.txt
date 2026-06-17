@@ -1,2 +1,2 @@
 Create an Ideogram 4 structured JSON caption for this image.
-Do not reference any existing sidecar caption.
+Do not reference any existing text caption.

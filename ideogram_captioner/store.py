@@ -54,7 +54,7 @@ class CaptionStore:
     def load_caption(self, image_path: Path) -> tuple[dict[str, Any], str | None]:
         caption_path = self.caption_path(image_path)
         if not caption_path.exists():
-            return default_caption(), f"No {self.extension} caption yet; edit fields or click Save to create it."
+            return default_caption(), f"No {self.extension} JSON caption yet; edit fields or click Save to create it."
 
         raw = caption_path.read_text(encoding="utf-8-sig")
         if not raw.strip():

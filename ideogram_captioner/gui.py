@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -103,8 +104,8 @@ IMAGE_SORT_NAME_ASC = "Name A-Z"
 IMAGE_SORT_NAME_DESC = "Name Z-A"
 IMAGE_SORT_MODIFIED_NEWEST = "Modified newest"
 IMAGE_SORT_MODIFIED_OLDEST = "Modified oldest"
-IMAGE_SORT_CAPTION_MISSING = "Caption missing first"
-IMAGE_SORT_ORIGINAL_MISSING = "Original missing first"
+IMAGE_SORT_JSON_MISSING = "Missing/blank JSON captions only"
+IMAGE_SORT_TEXT_MISSING = "Missing/blank text captions only"
 IMAGE_SORT_BBOX_MISSING = "Missing bboxes only"
 IMAGE_SORT_FAILED = "Failed captions only"
 IMAGE_SORT_OPTIONS = (
@@ -112,19 +113,20 @@ IMAGE_SORT_OPTIONS = (
     IMAGE_SORT_NAME_DESC,
     IMAGE_SORT_MODIFIED_NEWEST,
     IMAGE_SORT_MODIFIED_OLDEST,
-    IMAGE_SORT_CAPTION_MISSING,
-    IMAGE_SORT_ORIGINAL_MISSING,
+    IMAGE_SORT_JSON_MISSING,
+    IMAGE_SORT_TEXT_MISSING,
     IMAGE_SORT_BBOX_MISSING,
     IMAGE_SORT_FAILED,
 )
 CAPTION_FILTER_JSON = "JSON caption"
-CAPTION_FILTER_ORIGINAL = "Original caption"
-CAPTION_FILTER_BOTH = "JSON + original"
+CAPTION_FILTER_ORIGINAL = "Text caption"
+CAPTION_FILTER_BOTH = "JSON + text"
 CAPTION_FILTER_SCOPES = (CAPTION_FILTER_BOTH, CAPTION_FILTER_JSON, CAPTION_FILTER_ORIGINAL)
 CAPTION_FILTER_ANY_MODE = "Any mode"
 CAPTION_FILTER_ANY_MEDIUM = "Any medium"
 CAPTION_FILTER_MODE_OPTIONS = (CAPTION_FILTER_ANY_MODE, *STYLE_MODES)
 CAPTION_FILTER_MEDIUM_OPTIONS = (CAPTION_FILTER_ANY_MEDIUM, *COMMON_MEDIA)
+ASYNC_IMAGE_FILTER_SORTS = {IMAGE_SORT_JSON_MISSING, IMAGE_SORT_TEXT_MISSING}
 RUNTIME_LOCAL_LABEL = "Local llama.cpp (recommended)"
 RUNTIME_EXISTING_LABEL = "Connect to existing server"
 RUNTIME_CUSTOM_LABEL = "Custom start commands"
@@ -799,6 +801,10 @@ class CaptionEditorApp(tk.Tk):
         self.caption_filter_worker: threading.Thread | None = None
         self.caption_filter_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.caption_filter_generation = 0
+        self.image_filter_worker: threading.Thread | None = None
+        self.image_filter_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.image_filter_generation = 0
+        self.image_filter_completion: Callable[[], None] | None = None
 
         self.caption_extension_var = tk.StringVar(value=".json")
         self.original_extension_var = tk.StringVar(value=".txt")
@@ -810,7 +816,7 @@ class CaptionEditorApp(tk.Tk):
         self.status_var = tk.StringVar(value="Open a folder to begin.")
         self.ai_progress_var = tk.DoubleVar(value=0.0)
         self.ai_progress_text_var = tk.StringVar(value="")
-        self.original_status_var = tk.StringVar(value="Original: .txt")
+        self.original_status_var = tk.StringVar(value="Text caption: .txt")
         self.image_title_var = tk.StringVar(value="No image loaded")
         self.style_mode_var = tk.StringVar(value="photo")
         self.medium_var = tk.StringVar(value="photograph")
@@ -871,6 +877,14 @@ class CaptionEditorApp(tk.Tk):
         )
         style.map("Treeview", background=[("selected", "#315fbd")], foreground=[("selected", "#ffffff")])
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#252b36", foreground="#d9dee9")
+        style.configure(
+            "HighContrast.Horizontal.TProgressbar",
+            troughcolor="#070a0f",
+            background="#ffd43b",
+            bordercolor="#5b6475",
+            lightcolor="#ffe066",
+            darkcolor="#c27c00",
+        )
 
     def _build_ui(self) -> None:
         self.rowconfigure(2, weight=1)
@@ -881,7 +895,7 @@ class CaptionEditorApp(tk.Tk):
         toolbar.columnconfigure(10, weight=1)
 
         ttk.Button(toolbar, text="Open Folder", command=self.open_folder_dialog).grid(row=0, column=0, padx=(0, 8))
-        ttk.Label(toolbar, text="Caption files", style="Status.TLabel").grid(row=0, column=1, padx=(0, 6))
+        ttk.Label(toolbar, text="JSON caption", style="Status.TLabel").grid(row=0, column=1, padx=(0, 6))
         self.extension_combo = ttk.Combobox(
             toolbar,
             textvariable=self.caption_extension_var,
@@ -890,7 +904,7 @@ class CaptionEditorApp(tk.Tk):
             width=10,
         )
         self.extension_combo.grid(row=0, column=2, padx=(0, 8))
-        ttk.Label(toolbar, text="Original files", style="Status.TLabel").grid(row=0, column=3, padx=(0, 6))
+        ttk.Label(toolbar, text="Text caption", style="Status.TLabel").grid(row=0, column=3, padx=(0, 6))
         self.original_extension_combo = ttk.Combobox(
             toolbar,
             textvariable=self.original_extension_var,
@@ -917,6 +931,7 @@ class CaptionEditorApp(tk.Tk):
             variable=self.ai_progress_var,
             mode="determinate",
             maximum=1,
+            style="HighContrast.Horizontal.TProgressbar",
         )
         self.ai_progress_bar.grid(row=0, column=1, sticky="ew")
         self.ai_progress_frame.grid_remove()
@@ -1183,7 +1198,7 @@ class CaptionEditorApp(tk.Tk):
 
         ttk.Separator(parent).grid(row=row, column=0, sticky="ew", pady=12)
         row += 1
-        ttk.Label(parent, text="Original Caption", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(parent, text="Text Caption", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
         self.original_status_label = ttk.Label(parent, textvariable=self.original_status_var)
         self.original_status_label.grid(row=row, column=0, sticky="w", pady=(0, 2))
@@ -1604,10 +1619,10 @@ class CaptionEditorApp(tk.Tk):
     def load_original_text(self, image_path: Path) -> None:
         original_path = self.original_path_for_image(image_path)
         if original_path is None:
-            self.clear_original_text("Original: none")
+            self.clear_original_text("Text caption: none")
             return
         if self.store is not None and self.store.caption_path(image_path) == original_path:
-            self.clear_original_text(f"Original: {original_path.name} is the active caption file")
+            self.clear_original_text(f"Text caption: {original_path.name} is the active JSON caption")
             return
 
         self.loading_original = True
@@ -1616,13 +1631,13 @@ class CaptionEditorApp(tk.Tk):
             text = original_path.read_text(encoding="utf-8-sig") if original_path.exists() else ""
         except OSError as exc:
             text = ""
-            self.original_status_var.set(f"Original: could not read {original_path.name}: {exc}")
+            self.original_status_var.set(f"Text caption: could not read {original_path.name}: {exc}")
             self.current_original_path = None
         else:
             if original_path.exists():
-                self.original_status_var.set(f"Original: {original_path.name}")
+                self.original_status_var.set(f"Text caption: {original_path.name}")
             else:
-                self.original_status_var.set(f"Original: no {original_path.name} yet")
+                self.original_status_var.set(f"Text caption: no {original_path.name} yet")
         self._set_text(self.original_text, text)
         self.original_dirty = False
         self.update_original_text_state()
@@ -1651,6 +1666,82 @@ class CaptionEditorApp(tk.Tk):
     def image_has_original(self, image_path: Path) -> bool:
         original_path = self.original_path_for_image(image_path)
         return original_path is not None and original_path.exists()
+
+    @staticmethod
+    def caption_has_json_content(caption: Any) -> bool:
+        normalized = normalize_caption(caption)
+        if str(normalized.get("high_level_description", "")).strip():
+            return True
+
+        style = normalized.get("style_description", {})
+        if isinstance(style, dict):
+            if str(style.get("aesthetics", "")).strip() or str(style.get("lighting", "")).strip():
+                return True
+            if style.get("color_palette"):
+                return True
+            if "art_style" in style:
+                if str(style.get("art_style", "")).strip():
+                    return True
+                return True
+            if str(style.get("photo", "")).strip():
+                return True
+            medium = str(style.get("medium", "")).strip().lower()
+            if medium and medium != "photograph":
+                return True
+
+        comp = normalized.get("compositional_deconstruction", {})
+        if isinstance(comp, dict):
+            if str(comp.get("background", "")).strip():
+                return True
+            elements = comp.get("elements", [])
+            if isinstance(elements, list):
+                for element in elements:
+                    if not isinstance(element, dict):
+                        continue
+                    if element.get("bbox") or element.get("color_palette"):
+                        return True
+                    if str(element.get("desc", "")).strip() or str(element.get("text", "")).strip():
+                        return True
+        return False
+
+    @classmethod
+    def json_caption_file_is_blank(cls, path: Path) -> bool:
+        if not path.exists():
+            return True
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            return False
+        if not raw.strip():
+            return True
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        return not cls.caption_has_json_content(parsed)
+
+    @staticmethod
+    def text_caption_file_is_blank(path: Path) -> bool:
+        if not path.exists():
+            return True
+        try:
+            return not path.read_text(encoding="utf-8-sig", errors="ignore").strip()
+        except OSError:
+            return False
+
+    @classmethod
+    def image_matches_missing_caption_filter(
+        cls,
+        image_path: Path,
+        sort_mode: str,
+        caption_extension: str,
+        original_extension: str | None,
+    ) -> bool:
+        if sort_mode == IMAGE_SORT_JSON_MISSING:
+            return cls.json_caption_file_is_blank(image_path.with_suffix(caption_extension))
+        if sort_mode == IMAGE_SORT_TEXT_MISSING:
+            return original_extension is None or cls.text_caption_file_is_blank(image_path.with_suffix(original_extension))
+        return True
 
     @staticmethod
     def caption_filter_paths_for_image(
@@ -1767,11 +1858,28 @@ class CaptionEditorApp(tk.Tk):
             for element in elements
         )
 
-    def visible_images_for_current_mode(self) -> list[Path]:
+    def visible_images_for_current_mode(self, missing_matches: set[Path] | None = None) -> list[Path]:
         images = list(self.all_images)
-        if self.image_sort_var.get() == IMAGE_SORT_BBOX_MISSING:
+        sort_mode = self.image_sort_var.get()
+        if sort_mode in ASYNC_IMAGE_FILTER_SORTS:
+            if missing_matches is None:
+                caption_extension = self.caption_extension_var.get()
+                original_extension = self.selected_original_extension()
+                images = [
+                    image_path
+                    for image_path in images
+                    if self.image_matches_missing_caption_filter(
+                        image_path,
+                        sort_mode,
+                        caption_extension,
+                        original_extension,
+                    )
+                ]
+            else:
+                images = [image_path for image_path in images if image_path in missing_matches]
+        elif sort_mode == IMAGE_SORT_BBOX_MISSING:
             images = [image_path for image_path in images if self.image_has_missing_bboxes(image_path)]
-        elif self.image_sort_var.get() == IMAGE_SORT_FAILED:
+        elif sort_mode == IMAGE_SORT_FAILED:
             images = [image_path for image_path in images if self.image_has_failure_marker(image_path)]
         if self.caption_filter_matches is not None:
             images = [image_path for image_path in images if image_path in self.caption_filter_matches]
@@ -1785,17 +1893,17 @@ class CaptionEditorApp(tk.Tk):
             return sorted(images, key=lambda path: (-self.image_modified_time(path), self.image_name_key(path)))
         if sort_mode == IMAGE_SORT_MODIFIED_OLDEST:
             return sorted(images, key=lambda path: (self.image_modified_time(path), self.image_name_key(path)))
-        if sort_mode == IMAGE_SORT_CAPTION_MISSING:
-            return sorted(images, key=lambda path: (self.image_has_caption(path), self.image_name_key(path)))
-        if sort_mode == IMAGE_SORT_ORIGINAL_MISSING:
-            return sorted(images, key=lambda path: (self.image_has_original(path), self.image_name_key(path)))
         return sorted(images, key=self.image_name_key)
 
-    def apply_image_sort(self, preserve_current: bool = True) -> None:
-        current_path = None
+    def apply_image_sort(
+        self,
+        preserve_current: bool = True,
+        missing_matches: set[Path] | None = None,
+        current_path: Path | None = None,
+    ) -> None:
         if preserve_current and 0 <= self.current_index < len(self.images):
-            current_path = self.images[self.current_index]
-        self.images = self.sorted_images(self.visible_images_for_current_mode())
+            current_path = current_path or self.images[self.current_index]
+        self.images = self.sorted_images(self.visible_images_for_current_mode(missing_matches=missing_matches))
         if current_path is not None and current_path in self.images:
             self.current_index = self.images.index(current_path)
         elif not self.images:
@@ -1804,6 +1912,155 @@ class CaptionEditorApp(tk.Tk):
             self.current_index = -1
         else:
             self.current_index = min(max(self.current_index, 0), len(self.images) - 1)
+
+    def current_sort_needs_async_image_filter(self) -> bool:
+        return self.image_sort_var.get() in ASYNC_IMAGE_FILTER_SORTS
+
+    def missing_caption_filter_label(self, sort_mode: str | None = None) -> str:
+        sort_mode = self.image_sort_var.get() if sort_mode is None else sort_mode
+        if sort_mode == IMAGE_SORT_JSON_MISSING:
+            return "Filtering missing/blank JSON captions"
+        if sort_mode == IMAGE_SORT_TEXT_MISSING:
+            return "Filtering missing/blank text captions"
+        return "Filtering images"
+
+    def refresh_image_view(
+        self,
+        preserve_current: bool = True,
+        current_path: Path | None = None,
+        completion: Callable[[], None] | None = None,
+    ) -> bool:
+        if self.current_sort_needs_async_image_filter() and self.store is not None:
+            self.start_image_filter_worker(
+                preserve_current=preserve_current,
+                current_path=current_path,
+                completion=completion,
+            )
+            return False
+
+        self.image_filter_generation += 1
+        self.image_filter_completion = None
+        self.apply_image_sort(preserve_current=preserve_current, current_path=current_path)
+        self.populate_image_list()
+        if completion is not None:
+            completion()
+        return True
+
+    def start_image_filter_worker(
+        self,
+        preserve_current: bool,
+        current_path: Path | None,
+        completion: Callable[[], None] | None,
+    ) -> None:
+        if current_path is None and preserve_current and 0 <= self.current_index < len(self.images):
+            current_path = self.images[self.current_index]
+        self.image_filter_generation += 1
+        generation = self.image_filter_generation
+        self.image_filter_completion = completion
+        sort_mode = self.image_sort_var.get()
+        images = list(self.all_images)
+        caption_extension = self.caption_extension_var.get()
+        original_extension = self.selected_original_extension()
+        label = self.missing_caption_filter_label(sort_mode)
+
+        self.show_ai_progress(label, len(images))
+        self.status_var.set(f"{label} for {len(images)} image(s)...")
+        self.image_filter_worker = threading.Thread(
+            target=self.image_filter_worker_main,
+            args=(
+                generation,
+                images,
+                sort_mode,
+                caption_extension,
+                original_extension,
+                preserve_current,
+                current_path,
+            ),
+            daemon=True,
+        )
+        self.image_filter_worker.start()
+        self.after(50, self.poll_image_filter_queue)
+
+    def image_filter_worker_main(
+        self,
+        generation: int,
+        images: list[Path],
+        sort_mode: str,
+        caption_extension: str,
+        original_extension: str | None,
+        preserve_current: bool,
+        current_path: Path | None,
+    ) -> None:
+        total = len(images)
+        matches: set[Path] = set()
+        update_every = max(1, total // 100)
+        for index, image_path in enumerate(images, start=1):
+            if self.image_matches_missing_caption_filter(image_path, sort_mode, caption_extension, original_extension):
+                matches.add(image_path)
+            if index == total or index % update_every == 0:
+                self.image_filter_queue.put(
+                    {"type": "progress", "generation": generation, "current": index, "total": total, "sort": sort_mode}
+                )
+        self.image_filter_queue.put(
+            {
+                "type": "done",
+                "generation": generation,
+                "matches": matches,
+                "sort": sort_mode,
+                "total": total,
+                "preserve_current": preserve_current,
+                "current_path": current_path,
+            }
+        )
+
+    def poll_image_filter_queue(self) -> None:
+        final_event: dict[str, Any] | None = None
+        while True:
+            try:
+                event = self.image_filter_queue.get_nowait()
+            except queue.Empty:
+                break
+            if int(event.get("generation", -1)) != self.image_filter_generation:
+                continue
+            sort_mode = str(event.get("sort", self.image_sort_var.get()))
+            if event.get("type") == "progress":
+                self.update_ai_progress(
+                    self.missing_caption_filter_label(sort_mode),
+                    int(event.get("current", 0)),
+                    int(event.get("total", 1)),
+                )
+            elif event.get("type") == "done":
+                final_event = event
+
+        if final_event is not None:
+            self.finish_image_filter(final_event)
+            return
+
+        if self.image_filter_worker is not None and self.image_filter_worker.is_alive():
+            self.after(50, self.poll_image_filter_queue)
+            return
+        self.image_filter_worker = None
+
+    def finish_image_filter(self, event: dict[str, Any]) -> None:
+        self.image_filter_worker = None
+        matches = event.get("matches", set())
+        missing_matches = set(matches) if isinstance(matches, set) else set()
+        sort_mode = str(event.get("sort", self.image_sort_var.get()))
+        current_path = event.get("current_path")
+        if not isinstance(current_path, Path):
+            current_path = None
+        self.apply_image_sort(
+            preserve_current=bool(event.get("preserve_current", True)),
+            missing_matches=missing_matches,
+            current_path=current_path,
+        )
+        self.populate_image_list()
+        total = int(event.get("total", len(self.all_images)))
+        self.update_ai_progress(self.missing_caption_filter_label(sort_mode), total, total)
+        completion = self.image_filter_completion
+        self.image_filter_completion = None
+        if completion is not None:
+            completion()
 
     def clear_loaded_image(self, message: str) -> None:
         self.current_index = -1
@@ -1815,7 +2072,7 @@ class CaptionEditorApp(tk.Tk):
         self.pil_image = None
         self.canvas_image_id = None
         self.image_render_key = None
-        self.clear_original_text("Original: no image loaded")
+        self.clear_original_text("Text caption: no image loaded")
         self.populate_form()
         self.render_image()
         self.status_var.set(message)
@@ -1828,16 +2085,18 @@ class CaptionEditorApp(tk.Tk):
         self.all_images = self.store.images()
         self.images = []
         self.current_index = -1
-        self.apply_image_sort(preserve_current=False)
-        self.populate_image_list()
         if not self.all_images:
             self.status_var.set(f"No images found in {folder}")
             self.clear_loaded_image(f"No images found in {folder}")
             return
-        if not self.images:
-            self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
-            return
-        self.load_image_at(0, reset_editor_scroll=True)
+
+        def finish_open_folder() -> None:
+            if not self.images:
+                self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+                return
+            self.load_image_at(0, reset_editor_scroll=True)
+
+        self.refresh_image_view(preserve_current=False, completion=finish_open_folder)
 
     def reset_caption_filter_state(self, clear_query: bool = True) -> None:
         self.caption_filter_generation += 1
@@ -1861,6 +2120,9 @@ class CaptionEditorApp(tk.Tk):
         if self.caption_filter_worker is not None and self.caption_filter_worker.is_alive():
             self.status_var.set("Caption search is already running.")
             return
+        if self.image_filter_worker is not None and self.image_filter_worker.is_alive():
+            self.status_var.set("Wait for the current image filter to finish before searching captions.")
+            return
         if self.ai_worker is not None and self.ai_worker.is_alive():
             self.status_var.set("Wait for the current auto-captioning job to finish before searching captions.")
             return
@@ -1877,7 +2139,7 @@ class CaptionEditorApp(tk.Tk):
             self.caption_filter_scope_var.set(scope)
         original_extension = self.selected_original_extension()
         if query and scope == CAPTION_FILTER_ORIGINAL and original_extension is None:
-            self.status_var.set("Choose an original caption extension before searching original captions.")
+            self.status_var.set("Choose a text caption extension before searching text captions.")
             return
 
         self.caption_filter_generation += 1
@@ -1900,14 +2162,16 @@ class CaptionEditorApp(tk.Tk):
         was_active = self.caption_filter_matches is not None
         self.reset_caption_filter_state()
         selected_paths = self.current_image_selection_paths()
-        self.apply_image_sort(preserve_current=True)
-        self.populate_image_list()
-        if self.images:
-            self.populate_image_selection(selected_paths=selected_paths)
-            self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
-            self.status_var.set("Caption search cleared." if was_active else "No caption search is active.")
-        else:
-            self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        def finish_clear_filter() -> None:
+            if self.images:
+                self.populate_image_selection(selected_paths=selected_paths)
+                self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
+                self.status_var.set("Caption search cleared." if was_active else "No caption search is active.")
+            else:
+                self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        self.refresh_image_view(preserve_current=True, completion=finish_clear_filter)
 
     def caption_filter_worker_main(
         self,
@@ -1987,18 +2251,20 @@ class CaptionEditorApp(tk.Tk):
         self.caption_filter_active_mode = str(event.get("mode", ""))
         self.caption_filter_active_medium = str(event.get("medium", ""))
         selected_paths = self.current_image_selection_paths()
-        self.apply_image_sort(preserve_current=True)
-        self.populate_image_list()
         total = int(event.get("total", len(self.all_images)))
         self.update_ai_progress("Filtering captions", total, total)
-        if self.images:
-            self.populate_image_selection(selected_paths=selected_paths)
-            self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
-            self.status_var.set(
-                f"Showing {len(self.images)}/{total} image(s) matching {self.image_filter_description()}."
-            )
-        else:
-            self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        def finish_filter() -> None:
+            if self.images:
+                self.populate_image_selection(selected_paths=selected_paths)
+                self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
+                self.status_var.set(
+                    f"Showing {len(self.images)}/{total} image(s) matching {self.image_filter_description()}."
+                )
+            else:
+                self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        self.refresh_image_view(preserve_current=True, completion=finish_filter)
 
     def image_list_vertical_scroll(self) -> tuple[float, float] | None:
         try:
@@ -2168,16 +2434,25 @@ class CaptionEditorApp(tk.Tk):
 
     def on_image_sort_changed(self, _event: tk.Event) -> None:
         selected_paths = self.current_image_selection_paths()
+        if self.current_sort_needs_async_image_filter():
+            if self.caption_filter_worker is not None and self.caption_filter_worker.is_alive():
+                self.status_var.set("Wait for the current caption search to finish before filtering images.")
+                return
+            if self.ai_worker is not None and self.ai_worker.is_alive():
+                self.status_var.set("Wait for the current auto-captioning job to finish before filtering images.")
+                return
         if self.dirty or self.original_dirty:
             self.save_current()
-        self.apply_image_sort(preserve_current=True)
-        self.populate_image_list()
-        if self.images:
-            self.populate_image_selection(selected_paths=selected_paths)
-            self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
-            self.status_var.set(f"Showing {len(self.images)} image(s) matching {self.image_filter_description()}.")
-        else:
-            self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        def finish_sort() -> None:
+            if self.images:
+                self.populate_image_selection(selected_paths=selected_paths)
+                self.load_image_at(self.current_index if self.current_index >= 0 else 0, skip_save=True, force_reload=True)
+                self.status_var.set(f"Showing {len(self.images)} image(s) matching {self.image_filter_description()}.")
+            else:
+                self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        self.refresh_image_view(preserve_current=True, completion=finish_sort)
 
     def load_image_at(
         self,
@@ -2211,7 +2486,7 @@ class CaptionEditorApp(tk.Tk):
             self.canvas_image_id = None
             self.image_render_key = None
             self.current_caption = default_caption()
-            self.clear_original_text("Original: image unavailable")
+            self.clear_original_text("Text caption: image unavailable")
             self.status_var.set(f"Could not open {image_path.name}: {exc}")
             self.render_image()
             return
@@ -2776,7 +3051,10 @@ class CaptionEditorApp(tk.Tk):
             self.status_var.set("No AI captioning job to undo.")
             return
         snapshot = self.ai_undo_stack[-1]
-        if not messagebox.askyesno("Undo AI captioning", f"Restore sidecars changed by the last {snapshot['label']} job?"):
+        if not messagebox.askyesno(
+            "Undo AI captioning",
+            f"Restore JSON/text captions changed by the last {snapshot['label']} job?",
+        ):
             return
         try:
             for item in snapshot["items"]:
@@ -2796,6 +3074,9 @@ class CaptionEditorApp(tk.Tk):
             return
         if self.caption_filter_worker is not None and self.caption_filter_worker.is_alive():
             self.status_var.set("Wait for the current caption search to finish before auto-captioning.")
+            return
+        if self.image_filter_worker is not None and self.image_filter_worker.is_alive():
+            self.status_var.set("Wait for the current image filter to finish before auto-captioning.")
             return
         if self.store is None or self.folder is None:
             self.status_var.set("Open an image folder before auto-captioning.")
@@ -3260,15 +3541,17 @@ class CaptionEditorApp(tk.Tk):
 
     def refresh_after_ai_job(self, message: str) -> None:
         selected_paths = self.current_image_selection_paths()
-        self.apply_image_sort(preserve_current=True)
-        self.populate_image_list()
-        self.populate_image_selection(selected_paths=selected_paths)
-        if 0 <= self.current_index < len(self.images):
-            self.load_image_at(self.current_index, preserve_selection=True, skip_save=True, force_reload=True)
-        elif not self.images:
-            self.clear_loaded_image(f"{message} No images match {self.image_filter_description()}.")
-            return
-        self.status_var.set(message)
+
+        def finish_refresh() -> None:
+            self.populate_image_selection(selected_paths=selected_paths)
+            if 0 <= self.current_index < len(self.images):
+                self.load_image_at(self.current_index, preserve_selection=True, skip_save=True, force_reload=True)
+            elif not self.images:
+                self.clear_loaded_image(f"{message} No images match {self.image_filter_description()}.")
+                return
+            self.status_var.set(message)
+
+        self.refresh_image_view(preserve_current=True, completion=finish_refresh)
 
     def mark_dirty(self, immediate: bool = False) -> None:
         if self.loading_form:
@@ -3293,7 +3576,7 @@ class CaptionEditorApp(tk.Tk):
         if immediate:
             self.save_current()
             return
-        self.status_var.set("Unsaved original changes...")
+        self.status_var.set("Unsaved text caption changes...")
         if self.original_autosave_job:
             self.after_cancel(self.original_autosave_job)
         self.original_autosave_job = self.after(700, self.autosave_original)
@@ -3311,10 +3594,10 @@ class CaptionEditorApp(tk.Tk):
             return None
         original_path.write_text(self._get_text(self.original_text), encoding="utf-8")
         self.original_dirty = False
-        self.original_status_var.set(f"Original: {original_path.name}")
+        self.original_status_var.set(f"Text caption: {original_path.name}")
         return original_path
 
-    def save_current(self) -> None:
+    def save_current(self) -> bool:
         if self.autosave_job:
             self.after_cancel(self.autosave_job)
             self.autosave_job = None
@@ -3322,26 +3605,64 @@ class CaptionEditorApp(tk.Tk):
             self.after_cancel(self.original_autosave_job)
             self.original_autosave_job = None
         if self.store is None or self.current_index < 0 or self.current_index >= len(self.images):
-            return
+            return False
         selected_paths = self.current_image_selection_paths()
         list_scroll = self.image_list_vertical_scroll()
         self.sync_caption_from_form()
         image_path = self.images[self.current_index]
+        old_index = self.current_index
+        caption_path = self.store.caption_path(image_path)
+        json_has_content = self.caption_has_json_content(self.current_caption)
+        should_save_json = self.dirty and (caption_path.exists() or json_has_content)
+        should_save_text = self.original_dirty
+        skipped_blank_json = self.dirty and not should_save_json and not json_has_content and not caption_path.exists()
+        if not should_save_json and not should_save_text:
+            if skipped_blank_json:
+                self.dirty = False
+                self.status_var.set("Blank JSON caption not saved.")
+            return False
+
         saved_names: list[str] = []
         try:
-            caption_path = self.store.save_caption(image_path, self.current_caption)
-            saved_names.append(caption_path.name)
-            original_path = self.save_current_original()
-            if original_path is not None:
-                saved_names.append(original_path.name)
+            if should_save_json:
+                saved_path = self.store.save_caption(image_path, self.current_caption)
+                saved_names.append(saved_path.name)
+                self.dirty = False
+            if should_save_text:
+                original_path = self.save_current_original()
+                if original_path is not None:
+                    saved_names.append(original_path.name)
         except OSError as exc:
             messagebox.showerror("Save failed", str(exc))
-            return
-        self.dirty = False
+            return False
+        if skipped_blank_json:
+            self.dirty = False
+        if not saved_names:
+            return False
+        saved_message = f"Saved {', '.join(saved_names)} at {time.strftime('%H:%M:%S')}"
+        if self.current_sort_needs_async_image_filter() and not self.image_matches_missing_caption_filter(
+            image_path,
+            self.image_sort_var.get(),
+            self.caption_extension_var.get(),
+            self.selected_original_extension(),
+        ):
+            self.images = [path for path in self.images if path != image_path]
+            if self.images:
+                self.current_index = min(old_index, len(self.images) - 1)
+                self.populate_image_list(preserve_scroll=True)
+                self.populate_image_selection(selected_paths=selected_paths, reveal_current=False)
+                self.restore_image_list_vertical_scroll(list_scroll)
+                self.load_image_at(self.current_index, skip_save=True, force_reload=True, reveal_selection=False)
+                self.status_var.set(saved_message)
+            else:
+                self.populate_image_list(preserve_scroll=True)
+                self.clear_loaded_image(f"{saved_message}. No images match {self.image_filter_description()}.")
+            return True
         self.populate_image_list(preserve_scroll=True)
         self.populate_image_selection(selected_paths=selected_paths, reveal_current=False)
         self.restore_image_list_vertical_scroll(list_scroll)
-        self.status_var.set(f"Saved {', '.join(saved_names)} at {time.strftime('%H:%M:%S')}")
+        self.status_var.set(saved_message)
+        return False
 
     def copy_current_image_to_edit(self) -> None:
         if self.current_index < 0 or self.current_index >= len(self.images):
@@ -3375,17 +3696,23 @@ class CaptionEditorApp(tk.Tk):
         ):
             self.reset_caption_filter_state()
         self.store = CaptionStore(self.folder, self.caption_extension_var.get())
-        self.apply_image_sort(preserve_current=True)
-        self.populate_image_list()
-        if current_path is not None and current_path in self.images:
-            index = self.images.index(current_path)
-            self.current_index = -1
-            self.load_image_at(index)
-        elif self.images:
-            self.current_index = -1
-            self.load_image_at(0)
-        else:
-            self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        def finish_caption_extension_change() -> None:
+            if current_path is not None and current_path in self.images:
+                index = self.images.index(current_path)
+                self.current_index = -1
+                self.load_image_at(index)
+            elif self.images:
+                self.current_index = -1
+                self.load_image_at(0)
+            else:
+                self.clear_loaded_image(f"No images match {self.image_filter_description()}.")
+
+        self.refresh_image_view(
+            preserve_current=True,
+            current_path=current_path,
+            completion=finish_caption_extension_change,
+        )
 
     def on_original_extension_changed(self, _event: tk.Event) -> None:
         try:
@@ -3403,12 +3730,14 @@ class CaptionEditorApp(tk.Tk):
             self.load_original_text(self.images[self.current_index])
         else:
             extension = self.selected_original_extension()
-            self.clear_original_text("Original: none" if extension is None else f"Original: {extension}")
-        if self.image_sort_var.get() == IMAGE_SORT_ORIGINAL_MISSING:
+            self.clear_original_text("Text caption: none" if extension is None else f"Text caption: {extension}")
+        if self.image_sort_var.get() == IMAGE_SORT_TEXT_MISSING:
             selected_paths = self.current_image_selection_paths()
-            self.apply_image_sort(preserve_current=True)
-            self.populate_image_list()
-            self.populate_image_selection(selected_paths=selected_paths)
+
+            def finish_original_extension_change() -> None:
+                self.populate_image_selection(selected_paths=selected_paths)
+
+            self.refresh_image_view(preserve_current=True, completion=finish_original_extension_change)
 
     def next_image(self) -> None:
         self.load_image_at(min(self.current_index + 1, len(self.images) - 1))
@@ -3439,13 +3768,13 @@ class CaptionEditorApp(tk.Tk):
         return "break"
 
     def save_and_next(self) -> None:
-        self.save_current()
-        if self.current_index < len(self.images) - 1:
+        current_removed = self.save_current()
+        if not current_removed and self.current_index < len(self.images) - 1:
             self.load_image_at(self.current_index + 1)
 
     def save_and_previous(self) -> None:
-        self.save_current()
-        if self.current_index > 0:
+        current_removed = self.save_current()
+        if not current_removed and self.current_index > 0:
             self.load_image_at(self.current_index - 1)
 
     def on_return_key(self, event: tk.Event) -> str | None:

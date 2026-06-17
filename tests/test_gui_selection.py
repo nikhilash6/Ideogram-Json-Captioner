@@ -2,7 +2,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ideogram_captioner.gui import CAPTION_FILTER_BOTH, CAPTION_FILTER_JSON, CAPTION_FILTER_ORIGINAL, CaptionEditorApp
+from ideogram_captioner.gui import (
+    CAPTION_FILTER_BOTH,
+    CAPTION_FILTER_JSON,
+    CAPTION_FILTER_ORIGINAL,
+    IMAGE_SORT_JSON_MISSING,
+    IMAGE_SORT_TEXT_MISSING,
+    CaptionEditorApp,
+)
+from ideogram_captioner.schema import default_caption
+from ideogram_captioner.store import CaptionStore
+
+
+class FakeVar:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
 
 
 class FakeListbox:
@@ -176,6 +196,83 @@ class GuiSelectionTests(unittest.TestCase):
                     image, "bright red", ".json", ".txt", CAPTION_FILTER_BOTH
                 )
             )
+
+    def test_missing_json_caption_mode_filters_to_missing_or_blank_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            captioned = folder / "captioned.png"
+            blank = folder / "blank.png"
+            empty = folder / "empty.png"
+            missing_a = folder / "missing-a.png"
+            missing_b = folder / "missing-b.png"
+            for image in (captioned, blank, empty, missing_a, missing_b):
+                image.write_bytes(b"x")
+            captioned.with_suffix(".json").write_text('{"high_level_description":"done"}', encoding="utf-8")
+            blank.with_suffix(".json").write_text("{}", encoding="utf-8")
+            empty.with_suffix(".json").write_text("   ", encoding="utf-8")
+
+            app = object.__new__(CaptionEditorApp)
+            app.all_images = [missing_b, captioned, empty, blank, missing_a]
+            app.images = list(app.all_images)
+            app.current_index = -1
+            app.caption_filter_matches = None
+            app.caption_extension_var = FakeVar(".json")
+            app.original_extension_var = FakeVar(".txt")
+            app.image_sort_var = FakeVar(IMAGE_SORT_JSON_MISSING)
+
+            app.apply_image_sort(preserve_current=False)
+
+            self.assertEqual(app.images, [blank, empty, missing_a, missing_b])
+
+    def test_missing_text_caption_mode_filters_to_images_without_text_caption_or_blank_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            captioned = folder / "captioned.png"
+            blank = folder / "blank.png"
+            missing_a = folder / "missing-a.png"
+            missing_b = folder / "missing-b.png"
+            for image in (captioned, blank, missing_a, missing_b):
+                image.write_bytes(b"x")
+            captioned.with_suffix(".txt").write_text("plain text", encoding="utf-8")
+            blank.with_suffix(".txt").write_text("  ", encoding="utf-8")
+
+            app = object.__new__(CaptionEditorApp)
+            app.all_images = [missing_b, captioned, blank, missing_a]
+            app.images = list(app.all_images)
+            app.current_index = -1
+            app.caption_filter_matches = None
+            app.caption_extension_var = FakeVar(".json")
+            app.original_extension_var = FakeVar(".txt")
+            app.image_sort_var = FakeVar(IMAGE_SORT_TEXT_MISSING)
+
+            app.apply_image_sort(preserve_current=False)
+
+            self.assertEqual(app.images, [blank, missing_a, missing_b])
+
+    def test_blank_json_caption_form_is_not_saved_as_new_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            image = folder / "sample.png"
+            image.write_bytes(b"x")
+
+            app = object.__new__(CaptionEditorApp)
+            app.store = CaptionStore(folder, ".json")
+            app.images = [image]
+            app.current_index = 0
+            app.current_caption = default_caption()
+            app.dirty = True
+            app.original_dirty = False
+            app.autosave_job = None
+            app.original_autosave_job = None
+            app.image_list = FakeListbox((0,))
+            app.status_var = FakeVar("")
+            app.sync_caption_from_form = lambda: None
+
+            app.save_current()
+
+            self.assertFalse(image.with_suffix(".json").exists())
+            self.assertFalse(app.dirty)
+            self.assertEqual(app.status_var.get(), "Blank JSON caption not saved.")
 
     def test_json_caption_style_fields_infers_mode_and_medium(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

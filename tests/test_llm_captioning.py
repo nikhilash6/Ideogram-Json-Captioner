@@ -9,6 +9,7 @@ from ideogram_captioner.llm_captioning import (
     CaptioningSettings,
     ModelAssets,
     ModelJsonError,
+    append_image_exif_context,
     build_llama_server_command,
     bbox_target_indices,
     bbox_target_indices_with_reasons,
@@ -18,7 +19,9 @@ from ideogram_captioner.llm_captioning import (
     ensure_model_assets,
     extract_json,
     format_prompt,
+    generate_json_from_image,
     generate_json_refinement,
+    image_exif_context,
     json_system_prompt,
     load_model_profiles,
     load_prompts,
@@ -288,12 +291,15 @@ class LlmCaptioningTests(unittest.TestCase):
             },
         }
 
-        with patch("ideogram_captioner.llm_captioning.chat_vision", return_value=raw) as chat:
+        with patch("ideogram_captioner.llm_captioning.chat_vision", return_value=raw) as chat, patch(
+            "ideogram_captioner.llm_captioning.image_exif_context",
+            return_value={"camera_model": "EOS R5"},
+        ):
             refined = generate_json_refinement(
                 CaptioningSettings(caption_model="vision-model"),
                 Path("sample.png"),
                 caption,
-                "original sidecar caption",
+                "text caption source",
                 "Add clothing and pose details to people.",
             )
 
@@ -303,8 +309,68 @@ class LlmCaptioningTests(unittest.TestCase):
         )
         request = chat.call_args.kwargs["user"]
         self.assertIn("Add clothing and pose details", request)
-        self.assertIn("original sidecar caption", request)
+        self.assertIn("text caption source", request)
         self.assertIn('"high_level_description": "A woman."', request)
+        self.assertIn('"camera_model":"EOS R5"', request)
+
+    def test_extracts_supported_image_exif_context(self):
+        from PIL import ExifTags, Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "sample.jpg"
+            exif = Image.Exif()
+            exif[ExifTags.Base.Make] = "Canon"
+            exif[ExifTags.Base.Model] = "EOS R5"
+            exif[ExifTags.Base.LensModel] = "RF 50mm F1.2"
+            exif[ExifTags.Base.FNumber] = (28, 10)
+            exif[ExifTags.Base.ExposureTime] = (1, 125)
+            exif[ExifTags.Base.FocalLength] = (50, 1)
+            exif[ExifTags.Base.ISOSpeedRatings] = 400
+            Image.new("RGB", (8, 8), "white").save(image_path, exif=exif)
+
+            context = image_exif_context(image_path)
+
+        self.assertEqual(context["camera_make"], "Canon")
+        self.assertEqual(context["camera_model"], "EOS R5")
+        self.assertEqual(context["lens_model"], "RF 50mm F1.2")
+        self.assertEqual(context["f_stop"], "f/2.8")
+        self.assertEqual(context["exposure_time"], "1/125s")
+        self.assertEqual(context["focal_length"], "50mm")
+        self.assertEqual(context["iso"], "400")
+
+    def test_append_image_exif_context_is_noop_without_supported_exif(self):
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "sample.png"
+            image_path.write_bytes(b"not an image")
+
+            self.assertEqual(append_image_exif_context("Describe.", image_path), "Describe.")
+
+    def test_json_from_image_sends_exif_metadata_when_available(self):
+        raw = json.dumps(
+            {
+                "high_level_description": "A studio portrait.",
+                "style_description": {
+                    "aesthetics": "clean",
+                    "lighting": "soft",
+                    "photo": "shallow depth of field",
+                    "medium": "photograph",
+                },
+                "compositional_deconstruction": {"background": "studio", "elements": []},
+            }
+        )
+
+        with patch("ideogram_captioner.llm_captioning.chat_vision", return_value=raw) as chat, patch(
+            "ideogram_captioner.llm_captioning.image_exif_context",
+            return_value={"f_stop": "f/2.8", "focal_length": "50mm", "iso": "400", "exposure_time": "1/125s"},
+        ):
+            generate_json_from_image(CaptioningSettings(caption_model="vision-model"), Path("sample.jpg"))
+
+        request = chat.call_args.kwargs["user"]
+        self.assertIn("Image EXIF metadata", request)
+        self.assertIn('"f_stop":"f/2.8"', request)
+        self.assertIn('"focal_length":"50mm"', request)
+        self.assertIn('"iso":"400"', request)
+        self.assertIn('"exposure_time":"1/125s"', request)
 
     def test_custom_local_profile_uses_selected_files(self):
         with tempfile.TemporaryDirectory() as temp:

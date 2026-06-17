@@ -1,7 +1,7 @@
 User edit instructions:
 {instructions}
 
-Existing sidecar caption:
+Existing text caption:
 {source_caption}
 
 Current structured JSON:

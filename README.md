@@ -16,14 +16,14 @@ Ollama-compatible server.
 - Edit Ideogram JSON fields for high-level description, style, background,
   elements, rendered text, bounding boxes, and color palettes.
 - Draw, move, resize, delete, and numerically edit bounding boxes.
-- Keep editable original captions, such as `.txt` or `.original`, separate from
-  structured JSON output.
+- Keep editable text captions, such as `.txt` or `.original`, separate from
+  structured JSON captions.
 - Generate text captions, JSON captions from text, JSON captions from images,
   JSON refinements, and bounding boxes with a local or existing
   vision-language model server.
 - Batch auto-caption selected images, retry failed captions, and undo the last
   auto-captioning job.
-- Sort and filter the image list by name, modified date, missing captions, or
+- Sort and filter the image list by name, modified date, missing/blank JSON/text captions, or
   failed auto-captioning jobs.
 - Filter by caption text, structured JSON mode (`photo` or `art_style`), and
   structured JSON medium.
@@ -53,8 +53,8 @@ python run_captioner.py
 
 ### Manual Captioning: 
 1. Open a folder that contains images.
-2. Choose the structured caption extension to edit, usually `.json`.
-3. Choose an original caption extension if you also want to edit source captions,
+2. Choose the JSON caption extension to edit, usually `.json`.
+3. Choose a text caption extension if you also want to edit source captions,
    such as `.txt` or `.original`.
 4. Select an image, edit the fields, then use `Save` or `Enter` to save and move
    to the next image.
@@ -99,19 +99,24 @@ another OpenAI-compatible server you started yourself.
 
 The right-side `Auto Captioning` buttons do the following:
 
-- `Text Caption`: creates or replaces the plain original-caption sidecar.
-- `JSON from Text`: converts the original caption into Ideogram JSON.
+- `Text Caption`: creates or replaces the plain text caption.
+- `JSON from Text`: converts the text caption into Ideogram JSON.
 - `JSON from Image`: creates Ideogram JSON directly from the image.
 - `Refine JSON`: revises existing structured JSON from the image, the current
-  JSON, the original caption sidecar, and custom instructions entered at run
+  JSON, the text caption, and custom instructions entered at run
   time.
 - `Add/redo BBoxes`: localizes existing JSON elements with the selected VLM.
 - `Retry Failed`: reruns images that have failed auto-captioning markers.
 - `Clear Failed`: removes failed markers without rerunning the model.
-- `Undo AI`: restores sidecar files from before the last auto-captioning job.
+- `Undo AI`: restores JSON/text captions from before the last auto-captioning job.
 
 Multiple images can be selected with Shift, Ctrl, or `Ctrl+A`. The app asks for
 confirmation before running an auto-captioning job on more than one image.
+
+Image-based JSON operations automatically send a compact EXIF summary when the
+image has supported camera fields such as camera/lens model, f-stop, focal
+length, ISO, exposure time, exposure bias, metering, flash, or white balance.
+GPS and other broad metadata are not sent.
 
 ## Failed Captions
 
