@@ -31,9 +31,14 @@ from .schema import (
 from .store import CaptionStore
 from .llm_captioning import (
     AutoCaptionError,
+    BBOX_BACKEND_VLM,
+    BBOX_BACKEND_YOLOE26,
     CaptioningSettings,
+    DEFAULT_YOLO_BBOX_IMGSZ,
+    DEFAULT_YOLOE26_BBOX_MODEL,
     ModelJsonError,
     add_bboxes_to_caption,
+    bbox_backend_uses_server,
     build_llama_server_command,
     default_models_dir,
     default_prompts_path,
@@ -137,6 +142,13 @@ RUNTIME_MODE_TO_LABEL = {
     "custom": RUNTIME_CUSTOM_LABEL,
 }
 RUNTIME_LABEL_TO_MODE = {label: mode for mode, label in RUNTIME_MODE_TO_LABEL.items()}
+BBOX_BACKEND_TO_LABEL = {
+    BBOX_BACKEND_VLM: "VLM grounding",
+    BBOX_BACKEND_YOLOE26: "YOLOE-26 prompts",
+}
+BBOX_BACKEND_LABEL_TO_MODE = {label: mode for mode, label in BBOX_BACKEND_TO_LABEL.items()}
+BBOX_BACKEND_LABELS = tuple(BBOX_BACKEND_TO_LABEL.values())
+ULTRALYTICS_BBOX_DEFAULT_MODELS = {DEFAULT_YOLOE26_BBOX_MODEL}
 
 
 def mix_hex_color(color: str, base: str, amount: float) -> str:
@@ -228,8 +240,15 @@ class CaptioningPreferencesDialog(tk.Toplevel):
         self.add_bboxes_var = tk.BooleanVar(value=settings.add_bboxes_after_json)
         self.overwrite_bboxes_var = tk.BooleanVar(value=settings.overwrite_bboxes)
         self.filter_bbox_targets_var = tk.BooleanVar(value=settings.filter_bbox_targets)
+        self.bbox_backend_var = tk.StringVar(
+            value=BBOX_BACKEND_TO_LABEL.get(settings.bbox_backend, BBOX_BACKEND_TO_LABEL[BBOX_BACKEND_VLM])
+        )
+        self.yolo_bbox_model_var = tk.StringVar(value=settings.yolo_bbox_model or DEFAULT_YOLOE26_BBOX_MODEL)
+        self.yolo_bbox_confidence_var = tk.StringVar(value=str(settings.yolo_bbox_confidence))
+        self.yolo_bbox_imgsz_var = tk.StringVar(value=str(settings.yolo_bbox_imgsz or DEFAULT_YOLO_BBOX_IMGSZ))
         self.creative_var = tk.BooleanVar(value=settings.creative_json)
         self.disable_thinking_var = tk.BooleanVar(value=settings.disable_thinking)
+        self.debug_llm_var = tk.BooleanVar(value=settings.debug_llm_output)
         self.vision_format_var = tk.StringVar(value=settings.vision_image_format)
         self.max_caption_tokens_var = tk.StringVar(value=str(settings.max_tokens_caption))
         self.max_json_tokens_var = tk.StringVar(value=str(settings.max_tokens_json))
@@ -512,6 +531,7 @@ class CaptioningPreferencesDialog(tk.Toplevel):
             ("Skip vague/ambient bbox targets", self.filter_bbox_targets_var),
             ("Creative text-to-JSON mode", self.creative_var),
             ("Disable model thinking/reasoning", self.disable_thinking_var),
+            ("Write LLM debug logs with thinking/tokens", self.debug_llm_var),
         ):
             ttk.Checkbutton(parent, text=text, variable=variable).grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
             row += 1
@@ -519,6 +539,22 @@ class CaptioningPreferencesDialog(tk.Toplevel):
         ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=12)
         row += 1
         parent.columnconfigure(1, weight=1)
+        ttk.Label(parent, text="BBox backend").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        bbox_backend_combo = ttk.Combobox(
+            parent,
+            textvariable=self.bbox_backend_var,
+            values=BBOX_BACKEND_LABELS,
+            state="readonly",
+        )
+        bbox_backend_combo.grid(row=row, column=1, sticky="ew", pady=4)
+        bbox_backend_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_bbox_backend_changed())
+        row += 1
+        row = self._add_entry(parent, row, "Ultralytics model/weights", self.yolo_bbox_model_var)
+        row = self._add_entry(parent, row, "Ultralytics confidence", self.yolo_bbox_confidence_var)
+        row = self._add_entry(parent, row, "Ultralytics image size", self.yolo_bbox_imgsz_var)
+
+        ttk.Separator(parent).grid(row=row, column=0, columnspan=2, sticky="ew", pady=12)
+        row += 1
         ttk.Label(parent, text="Vision image format").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
             parent,
@@ -563,6 +599,16 @@ class CaptioningPreferencesDialog(tk.Toplevel):
     def _on_runtime_mode_changed(self) -> None:
         if self._runtime_mode() == "existing":
             self.auto_start_var.set(False)
+
+    def _bbox_backend(self) -> str:
+        return BBOX_BACKEND_LABEL_TO_MODE.get(self.bbox_backend_var.get(), BBOX_BACKEND_VLM)
+
+    def _on_bbox_backend_changed(self) -> None:
+        current_model = self.yolo_bbox_model_var.get().strip()
+        if current_model and current_model not in ULTRALYTICS_BBOX_DEFAULT_MODELS:
+            return
+        if self._bbox_backend() == BBOX_BACKEND_YOLOE26:
+            self.yolo_bbox_model_var.set(DEFAULT_YOLOE26_BBOX_MODEL)
 
     def _profile_for_label(self, task: str, label: str):
         for profile in profiles_for_task(task):
@@ -627,6 +673,12 @@ class CaptioningPreferencesDialog(tk.Toplevel):
             raise ValueError(f"{label} must be at least {minimum}.")
         return value
 
+    def _parse_probability(self, variable: tk.StringVar, label: str) -> float:
+        value = self._parse_float(variable, label, 0.0)
+        if value > 1.0:
+            raise ValueError(f"{label} must be at most 1.")
+        return value
+
     def _save(self) -> None:
         try:
             settings = CaptioningSettings(
@@ -651,9 +703,14 @@ class CaptioningPreferencesDialog(tk.Toplevel):
                 add_bboxes_after_json=self.add_bboxes_var.get(),
                 overwrite_bboxes=self.overwrite_bboxes_var.get(),
                 filter_bbox_targets=self.filter_bbox_targets_var.get(),
+                bbox_backend=self._bbox_backend(),
+                yolo_bbox_model=self.yolo_bbox_model_var.get().strip() or DEFAULT_YOLOE26_BBOX_MODEL,
+                yolo_bbox_confidence=self._parse_probability(self.yolo_bbox_confidence_var, "Ultralytics confidence"),
+                yolo_bbox_imgsz=self._parse_int(self.yolo_bbox_imgsz_var, "Ultralytics image size", 0),
                 use_caption_model_for_bboxes=False,
                 creative_json=self.creative_var.get(),
                 disable_thinking=self.disable_thinking_var.get(),
+                debug_llm_output=self.debug_llm_var.get(),
                 vision_image_format=self.vision_format_var.get(),
                 max_tokens_caption=self._parse_int(self.max_caption_tokens_var, "Plain caption max tokens", 1),
                 max_tokens_json=self._parse_int(self.max_json_tokens_var, "JSON max tokens", 1),
@@ -3212,6 +3269,10 @@ class CaptionEditorApp(tk.Tk):
             nonlocal managed_process, managed_command, managed_phase
             if cancel_event.is_set():
                 raise AiJobCanceled()
+            if task == "bbox" and not bbox_backend_uses_server(settings):
+                backend_label = BBOX_BACKEND_TO_LABEL.get(settings.bbox_backend, "Ultralytics detector")
+                progress(f"Using {backend_label} ({settings.yolo_bbox_model}).")
+                return
             config = runtime_config_for_task(settings, task)
             if settings.server_start_mode == "existing" or not settings.auto_start_server:
                 ensure_endpoint_exposes_model(config.label, config.api_model)
@@ -3269,6 +3330,8 @@ class CaptionEditorApp(tk.Tk):
             return text[:limit].rstrip() + f"\n... truncated {len(text) - limit} character(s)"
 
         def model_alias_for_task(task: str) -> str:
+            if task == "bbox" and not bbox_backend_uses_server(settings):
+                return settings.yolo_bbox_model.strip() or DEFAULT_YOLOE26_BBOX_MODEL
             try:
                 return runtime_config_for_task(settings, task).api_model
             except Exception:

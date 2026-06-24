@@ -47,3 +47,8 @@ Thumbs.db
 /captions/
 /output/
 /edit/
+yoloe-26x-seg.pt
+yoloe-26l-seg.pt
+yolo26x.pt
+yolo26m.pt
+mobileclip2_b.ts

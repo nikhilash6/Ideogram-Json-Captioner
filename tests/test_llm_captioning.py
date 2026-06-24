@@ -7,12 +7,15 @@ from pathlib import Path
 from ideogram_captioner.llm_captioning import (
     AutoCaptionError,
     CaptioningSettings,
+    DEFAULT_YOLOE26_BBOX_MODEL,
     ModelAssets,
     ModelJsonError,
+    add_bboxes_to_caption,
     append_image_exif_context,
     build_llama_server_command,
     bbox_target_indices,
     bbox_target_indices_with_reasons,
+    bbox_xyxy_pixels_to_yxyx,
     bbox_xyxy_to_yxyx,
     chat_text,
     chat_vision,
@@ -35,25 +38,28 @@ from ideogram_captioner.llm_captioning import (
     server_model_ids,
     should_try_bbox,
     strip_thinking_output,
+    yolo_detections_for_image,
     write_default_prompts,
 )
 
 
 class FakeMessage:
-    def __init__(self, content):
+    def __init__(self, content, reasoning_content=None):
         self.content = content
+        self.reasoning_content = reasoning_content
 
 
 class FakeChoice:
-    def __init__(self, content, finish_reason="stop"):
-        self.message = FakeMessage(content)
+    def __init__(self, content, finish_reason="stop", reasoning_content=None):
+        self.message = FakeMessage(content, reasoning_content=reasoning_content)
         self.finish_reason = finish_reason
 
 
 class FakeResponse:
-    def __init__(self, content, finish_reason="stop", model="fake-model"):
-        self.choices = [FakeChoice(content, finish_reason)]
+    def __init__(self, content, finish_reason="stop", model="fake-model", usage=None, reasoning_content=None):
+        self.choices = [FakeChoice(content, finish_reason, reasoning_content=reasoning_content)]
         self.model = model
+        self.usage = usage
 
 
 class FakeCompletions:
@@ -72,6 +78,37 @@ class FakeClient:
     def __init__(self, responses):
         self.completions = FakeCompletions(responses)
         self.chat = self
+
+
+class FakeYoloBoxes:
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls = cls
+
+
+class FakeYoloResult:
+    def __init__(self, boxes, names, orig_shape):
+        self.boxes = boxes
+        self.names = names
+        self.orig_shape = orig_shape
+
+
+class FakeYoloModel:
+    def __init__(self, result):
+        self.result = result
+        self.requests = []
+        self.classes = []
+        self.names = result.names
+
+    def set_classes(self, classes):
+        self.classes = list(classes)
+        self.names = {index: name for index, name in enumerate(self.classes)}
+        self.result.names = self.names
+
+    def predict(self, **kwargs):
+        self.requests.append(kwargs)
+        return [self.result]
 
 
 class LlmCaptioningTests(unittest.TestCase):
@@ -117,6 +154,72 @@ class LlmCaptioningTests(unittest.TestCase):
     def test_converts_bbox_coordinates(self):
         self.assertEqual(bbox_xyxy_to_yxyx([200, 100, 400, 300]), [100, 200, 300, 400])
         self.assertIsNone(bbox_xyxy_to_yxyx([200, 100, 200, 300]))
+
+    def test_converts_yolo_pixel_bbox_coordinates(self):
+        self.assertEqual(bbox_xyxy_pixels_to_yxyx([20, 10, 180, 90], width=200, height=100), [100, 100, 900, 900])
+        self.assertIsNone(bbox_xyxy_pixels_to_yxyx([20, 10, 20, 90], width=200, height=100))
+
+    def test_yoloe26_bbox_backend_uses_element_prompts(self):
+        result = FakeYoloResult(
+            FakeYoloBoxes(
+                xyxy=[[50, 20, 180, 90]],
+                conf=[0.81],
+                cls=[0],
+            ),
+            names={},
+            orig_shape=(100, 200),
+        )
+        model = FakeYoloModel(result)
+        caption = {
+            "high_level_description": "A product label.",
+            "style_description": {"aesthetics": "", "lighting": "", "photo": "", "medium": "photograph"},
+            "compositional_deconstruction": {
+                "background": "",
+                "elements": [
+                    {"type": "obj", "desc": "A small brass buckle on the black bag."},
+                    {"type": "obj", "desc": "A red embroidered sleeve patch."},
+                ],
+            },
+        }
+
+        with patch("ideogram_captioner.llm_captioning._load_yolo_model", return_value=model):
+            updated, attempted, added, reasons = add_bboxes_to_caption(
+                CaptioningSettings(bbox_backend="yoloe26", yolo_bbox_confidence=0.35),
+                Path("sample.jpg"),
+                caption,
+            )
+
+        elements = updated["compositional_deconstruction"]["elements"]
+        self.assertEqual(model.classes, ["A small brass buckle on the black bag.", "A red embroidered sleeve patch."])
+        self.assertEqual(elements[0]["bbox"], [200, 250, 900, 900])
+        self.assertNotIn("bbox", elements[1])
+        self.assertEqual(attempted, 2)
+        self.assertEqual(added, 1)
+        self.assertEqual(reasons["YOLOE-26 detected no matching prompt"], 1)
+        self.assertEqual(model.requests[0]["conf"], 0.35)
+        self.assertEqual(model.requests[0]["imgsz"], 1024)
+
+    def test_yoloe26_defaults_to_large_model_and_can_omit_imgsz(self):
+        settings = CaptioningSettings(bbox_backend="yoloe26", yolo_bbox_model="yolo26n.pt", yolo_bbox_imgsz=0)
+        self.assertEqual(settings.yolo_bbox_model, DEFAULT_YOLOE26_BBOX_MODEL)
+        self.assertEqual(settings.yolo_bbox_imgsz, 0)
+
+        result = FakeYoloResult(
+            FakeYoloBoxes(xyxy=[], conf=[], cls=[]),
+            names={},
+            orig_shape=(100, 200),
+        )
+        model = FakeYoloModel(result)
+        with patch("ideogram_captioner.llm_captioning._load_yolo_model", return_value=model):
+            yolo_detections_for_image(settings, Path("sample.jpg"))
+
+        self.assertNotIn("imgsz", model.requests[0])
+
+    def test_legacy_yolo26_settings_migrate_to_yoloe26(self):
+        settings = CaptioningSettings(bbox_backend="yolo26", yolo_bbox_model="yolo26x.pt")
+
+        self.assertEqual(settings.bbox_backend, "yoloe26")
+        self.assertEqual(settings.yolo_bbox_model, DEFAULT_YOLOE26_BBOX_MODEL)
 
     def test_parses_batch_bbox_response(self):
         parsed = parse_batch_bboxes('{"bboxes":{"0":[10,20,30,40],"1":null}}')
@@ -484,6 +587,36 @@ class LlmCaptioningTests(unittest.TestCase):
 
     def test_strips_thinking_tags_from_model_output(self):
         self.assertEqual(strip_thinking_output("<think>hidden</think>\nVisible caption."), "Visible caption.")
+
+    def test_debug_log_captures_thinking_and_token_usage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = CaptioningSettings(
+                models_dir=temp,
+                caption_model="debug-model",
+                disable_thinking=False,
+                debug_llm_output=True,
+            )
+            client = FakeClient(
+                [
+                    FakeResponse(
+                        "<think>hidden chain</think>\nVisible caption.",
+                        model="debug-model",
+                        usage={"prompt_tokens": 10, "completion_tokens": 7, "total_tokens": 17},
+                        reasoning_content="separate hidden chain",
+                    )
+                ]
+            )
+            with patch("ideogram_captioner.llm_captioning._make_openai_client", return_value=client):
+                result = chat_text(settings, "debug-model", "system", "user", 100)
+
+            self.assertEqual(result, "Visible caption.")
+            logs = list((Path(temp) / "llm_debug").glob("*.json"))
+            self.assertEqual(len(logs), 1)
+            data = json.loads(logs[0].read_text(encoding="utf-8"))
+            self.assertEqual(data["usage"]["total_tokens"], 17)
+            self.assertEqual(data["thinking_blocks"], ["hidden chain"])
+            self.assertEqual(data["reasoning_content"], "separate hidden chain")
+            self.assertEqual(data["visible_content"], "Visible caption.")
 
     def test_text_chat_warns_when_thinking_returns_no_visible_output(self):
         client = FakeClient([FakeResponse("", finish_reason="length", model="caption-model")])

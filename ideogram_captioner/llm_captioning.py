@@ -22,6 +22,13 @@ from .schema import normalize_bbox, normalize_caption
 
 ProgressCallback = Callable[[str], None]
 
+BBOX_BACKEND_VLM = "vlm"
+BBOX_BACKEND_YOLOE26 = "yoloe26"
+BBOX_BACKENDS = {BBOX_BACKEND_VLM, BBOX_BACKEND_YOLOE26}
+DEFAULT_YOLOE26_BBOX_MODEL = "yoloe-26l-seg.pt"
+DEFAULT_ULTRALYTICS_BBOX_CONFIDENCE = 0.25
+DEFAULT_YOLO_BBOX_IMGSZ = 1024
+
 
 class AutoCaptionError(RuntimeError):
     """Raised for user-actionable captioning setup or model failures."""
@@ -74,6 +81,15 @@ class ModelRuntimeConfig:
 class ModelAssets:
     model_path: Path | None = None
     mmproj_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class YoloDetection:
+    index: int
+    class_id: int
+    class_name: str
+    confidence: float
+    bbox: list[int]
 
 
 DEFAULT_JSON_REFINE_INSTRUCTIONS = """
@@ -324,9 +340,14 @@ class CaptioningSettings:
     add_bboxes_after_json: bool = True
     overwrite_bboxes: bool = True
     filter_bbox_targets: bool = False
+    bbox_backend: str = BBOX_BACKEND_VLM
+    yolo_bbox_model: str = DEFAULT_YOLOE26_BBOX_MODEL
+    yolo_bbox_confidence: float = DEFAULT_ULTRALYTICS_BBOX_CONFIDENCE
+    yolo_bbox_imgsz: int = DEFAULT_YOLO_BBOX_IMGSZ
     use_caption_model_for_bboxes: bool = False
     creative_json: bool = True
     disable_thinking: bool = True
+    debug_llm_output: bool = False
     vision_image_format: str = "auto"
     json_refine_instructions: str = DEFAULT_JSON_REFINE_INSTRUCTIONS
 
@@ -360,6 +381,31 @@ class CaptioningSettings:
             self.bbox_profile_id = "custom-hf"
         # Legacy setting kept only so older settings files still load.
         self.use_caption_model_for_bboxes = False
+        backend = str(self.bbox_backend).strip().lower()
+        if backend in {"yolo", "yolo26", "ultralytics", "yoloe", "yoloe26", "yoloe-26", "open-vocab", "open_vocab"}:
+            self.bbox_backend = BBOX_BACKEND_YOLOE26
+        else:
+            self.bbox_backend = BBOX_BACKEND_VLM
+        yolo_bbox_model = str(self.yolo_bbox_model or "").strip()
+        if self.bbox_backend == BBOX_BACKEND_YOLOE26 and (
+            not yolo_bbox_model or re.fullmatch(r"yolo26[nsmlx]?\.pt", yolo_bbox_model)
+        ):
+            yolo_bbox_model = DEFAULT_YOLOE26_BBOX_MODEL
+        self.yolo_bbox_model = yolo_bbox_model or DEFAULT_YOLOE26_BBOX_MODEL
+        try:
+            confidence = float(self.yolo_bbox_confidence)
+        except (TypeError, ValueError):
+            confidence = DEFAULT_ULTRALYTICS_BBOX_CONFIDENCE
+        self.yolo_bbox_confidence = max(0.0, min(1.0, confidence))
+        try:
+            imgsz = int(self.yolo_bbox_imgsz)
+        except (TypeError, ValueError):
+            imgsz = DEFAULT_YOLO_BBOX_IMGSZ
+        self.yolo_bbox_imgsz = max(0, imgsz)
+
+
+def bbox_backend_uses_server(settings: CaptioningSettings) -> bool:
+    return settings.bbox_backend != BBOX_BACKEND_YOLOE26
 
 
 def profile_labels(task: str) -> list[str]:
@@ -1016,8 +1062,91 @@ def request_user_prompt(settings: CaptioningSettings, user: str) -> str:
     return "/no_think\n\n" + user
 
 
+THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", flags=re.IGNORECASE | re.DOTALL)
+
+
+def _plain_response_value(value: Any, depth: int = 0) -> Any:
+    if depth > 5:
+        return repr(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _plain_response_value(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_response_value(item, depth + 1) for item in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return _plain_response_value(value.model_dump(mode="json"), depth + 1)
+        except TypeError:
+            return _plain_response_value(value.model_dump(), depth + 1)
+    if hasattr(value, "dict"):
+        try:
+            return _plain_response_value(value.dict(), depth + 1)
+        except TypeError:
+            pass
+    if hasattr(value, "__dict__"):
+        return {
+            key: _plain_response_value(item, depth + 1)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return repr(value)
+
+
+def _message_field(message: Any, name: str) -> Any:
+    if message is None:
+        return None
+    value = getattr(message, name, None)
+    if value is not None:
+        return value
+    for extra_name in ("model_extra", "additional_kwargs"):
+        extra = getattr(message, extra_name, None)
+        if isinstance(extra, dict) and name in extra:
+            return extra[name]
+    if isinstance(message, dict):
+        return message.get(name)
+    return None
+
+
+def _debug_log_path(settings: CaptioningSettings, kind: str, model: str) -> Path:
+    folder = Path(settings.models_dir).expanduser().resolve() / "llm_debug"
+    folder.mkdir(parents=True, exist_ok=True)
+    safe_kind = re.sub(r"[^A-Za-z0-9_.-]+", "_", kind).strip("_") or "request"
+    safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", model).strip("_") or "model"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return folder / f"{stamp}-{time.time_ns()}-{safe_kind}-{safe_model}.json"
+
+
+def write_llm_debug_log(settings: CaptioningSettings, kind: str, model: str, response: Any, choice: Any) -> Path | None:
+    if not settings.debug_llm_output:
+        return None
+    try:
+        message = getattr(choice, "message", None) if choice is not None else None
+        content = _message_field(message, "content")
+        content_text = content if isinstance(content, str) else ""
+        thinking_blocks = [match.group(1).strip() for match in THINK_BLOCK_RE.finditer(content_text)]
+        log_data = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "kind": kind,
+            "model": model,
+            "response_model": getattr(response, "model", ""),
+            "finish_reason": getattr(choice, "finish_reason", None) if choice is not None else None,
+            "usage": _plain_response_value(getattr(response, "usage", None)),
+            "reasoning_content": _plain_response_value(_message_field(message, "reasoning_content")),
+            "thinking_blocks": thinking_blocks,
+            "visible_content": strip_thinking_output(content_text) if content_text else "",
+            "raw_content": _plain_response_value(content),
+            "response": _plain_response_value(response),
+        }
+        path = _debug_log_path(settings, kind, model)
+        path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def strip_thinking_output(content: str) -> str:
-    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = THINK_BLOCK_RE.sub("", content)
     return cleaned.strip()
 
 
@@ -1078,6 +1207,7 @@ def chat_text(
     except Exception as exc:
         raise AutoCaptionError(request_failure_message("Text", exc)) from exc
     choice = response.choices[0] if response.choices else None
+    write_llm_debug_log(settings, "text", model, response, choice)
     content = choice.message.content if choice is not None else None
     visible_content = strip_thinking_output(content) if content else ""
     if visible_content:
@@ -1124,6 +1254,7 @@ def chat_vision(
         except Exception as exc:
             raise AutoCaptionError(request_failure_message("Vision", exc)) from exc
         choice = response.choices[0] if response.choices else None
+        write_llm_debug_log(settings, f"vision_image_first_{image_first}", model, response, choice)
         content = choice.message.content if choice is not None else None
         visible_content = strip_thinking_output(content) if content else ""
         if visible_content:
@@ -1613,6 +1744,322 @@ def bbox_xyxy_to_yxyx(bbox: Any) -> list[int] | None:
     return normalize_bbox([y1, x1, y2, x2])
 
 
+def bbox_xyxy_pixels_to_yxyx(bbox: Any, width: int, height: int) -> list[int] | None:
+    if width <= 0 or height <= 0 or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+    return bbox_xyxy_to_yxyx(
+        [
+            x1 * 1000.0 / width,
+            y1 * 1000.0 / height,
+            x2 * 1000.0 / width,
+            y2 * 1000.0 / height,
+        ]
+    )
+
+
+_YOLO_MODEL_CACHE: dict[str, Any] = {}
+
+
+def _load_yolo_model(model_name: str, progress: ProgressCallback | None = None, label: str = "Ultralytics") -> Any:
+    name = model_name.strip() or DEFAULT_YOLOE26_BBOX_MODEL
+    cached = _YOLO_MODEL_CACHE.get(name)
+    if cached is not None:
+        return cached
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise AutoCaptionError(f"Install ultralytics>=8.4.0 to use the {label} bbox backend.") from exc
+    if progress:
+        progress(f"Loading {label} model {name}...")
+    try:
+        model = YOLO(name)
+    except Exception as exc:  # pragma: no cover - depends on local model download/runtime
+        raise AutoCaptionError(f"Could not load {label} model '{name}': {exc}") from exc
+    _YOLO_MODEL_CACHE[name] = model
+    return model
+
+
+def _plain_list(value: Any) -> Any:
+    if value is None:
+        return []
+    for method_name in ("detach", "cpu"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            value = method()
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+
+def _rows_list(value: Any) -> list[list[float]]:
+    rows = _plain_list(value)
+    if not isinstance(rows, list):
+        return []
+    out: list[list[float]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 4:
+            continue
+        try:
+            out.append([float(row[0]), float(row[1]), float(row[2]), float(row[3])])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _flat_list(value: Any) -> list[Any]:
+    items = _plain_list(value)
+    if items is None:
+        return []
+    if isinstance(items, (int, float, str)):
+        return [items]
+    if isinstance(items, tuple):
+        return list(items)
+    if isinstance(items, list):
+        return items
+    return []
+
+
+def _class_names_map(names: Any) -> dict[int, str]:
+    if isinstance(names, dict):
+        out: dict[int, str] = {}
+        for key, value in names.items():
+            try:
+                class_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            label = str(value).strip()
+            if label:
+                out[class_id] = label
+        return out
+    if isinstance(names, (list, tuple)):
+        return {index: str(value).strip() for index, value in enumerate(names) if str(value).strip()}
+    return {}
+
+
+def _yolo_class_names(model: Any, result: Any) -> dict[int, str]:
+    result_names = _class_names_map(getattr(result, "names", None))
+    if result_names:
+        return result_names
+    return _class_names_map(getattr(model, "names", None))
+
+
+def _image_size_from_result(image_path: Path, result: Any) -> tuple[int, int]:
+    shape = getattr(result, "orig_shape", None)
+    if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+        try:
+            height = int(shape[0])
+            width = int(shape[1])
+            if width > 0 and height > 0:
+                return width, height
+        except (TypeError, ValueError):
+            pass
+    with Image.open(image_path) as image:
+        return image.size
+
+
+def yolo_detections_for_image(
+    settings: CaptioningSettings,
+    image_path: Path,
+    progress: ProgressCallback | None = None,
+    class_prompts: list[str] | None = None,
+    model_name: str | None = None,
+    label: str = "YOLOE-26",
+) -> tuple[list[YoloDetection], tuple[str, ...]]:
+    model_name = model_name or settings.yolo_bbox_model.strip() or DEFAULT_YOLOE26_BBOX_MODEL
+    model = _load_yolo_model(model_name, progress, label=label)
+    if class_prompts is not None:
+        try:
+            model.set_classes(class_prompts)
+        except Exception as exc:
+            raise AutoCaptionError(f"Could not set {label} text prompts: {exc}") from exc
+    if progress:
+        progress(f"Running {label} bbox detector ({model_name})...")
+    predict_kwargs: dict[str, Any] = {
+        "source": str(image_path),
+        "conf": settings.yolo_bbox_confidence,
+        "verbose": False,
+    }
+    if settings.yolo_bbox_imgsz > 0:
+        predict_kwargs["imgsz"] = settings.yolo_bbox_imgsz
+    try:
+        results = model.predict(**predict_kwargs)
+    except TypeError:
+        call_kwargs = {key: value for key, value in predict_kwargs.items() if key != "source"}
+        results = model(str(image_path), **call_kwargs)
+    except Exception as exc:  # pragma: no cover - depends on local model runtime
+        raise AutoCaptionError(f"{label} bbox detection failed for {image_path.name}: {exc}") from exc
+    if not results:
+        return [], tuple()
+
+    result = results[0]
+    boxes = getattr(result, "boxes", None)
+    names = _yolo_class_names(model, result)
+    class_names = tuple(name for _class_id, name in sorted(names.items()))
+    if boxes is None:
+        return [], class_names
+
+    width, height = _image_size_from_result(image_path, result)
+    xyxy_rows = _rows_list(getattr(boxes, "xyxy", None))
+    confidences = _flat_list(getattr(boxes, "conf", None))
+    classes = _flat_list(getattr(boxes, "cls", None))
+
+    detections: list[YoloDetection] = []
+    for index, xyxy in enumerate(xyxy_rows):
+        try:
+            class_id = int(float(classes[index])) if index < len(classes) else -1
+        except (TypeError, ValueError):
+            class_id = -1
+        try:
+            confidence = float(confidences[index]) if index < len(confidences) else 0.0
+        except (TypeError, ValueError):
+            confidence = 0.0
+        bbox = bbox_xyxy_pixels_to_yxyx(xyxy, width=width, height=height)
+        if bbox is None:
+            continue
+        detections.append(
+            YoloDetection(
+                index=index,
+                class_id=class_id,
+                class_name=names.get(class_id, str(class_id)),
+                confidence=confidence,
+                bbox=bbox,
+            )
+        )
+    return detections, class_names
+
+
+def _normalized_words(text: str) -> set[str]:
+    words = set(re.findall(r"[a-z0-9]+", text.lower()))
+    for word in list(words):
+        if len(word) > 4 and word.endswith("ies"):
+            words.add(word[:-3] + "y")
+        elif len(word) > 4 and word.endswith("es"):
+            words.add(word[:-2])
+        elif len(word) > 3 and word.endswith("s"):
+            words.add(word[:-1])
+    return words
+
+
+def _normalized_phrase(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _target_text(element: dict[str, Any]) -> str:
+    parts = [str(element.get("desc", ""))]
+    if element.get("type") == "text":
+        parts.append(str(element.get("text", "")))
+    return " ".join(part for part in parts if part.strip())
+
+
+def _detection_class_key(detection: YoloDetection) -> str:
+    return _normalized_phrase(detection.class_name)
+
+
+def _detection_area(detection: YoloDetection) -> int:
+    y1, x1, y2, x2 = detection.bbox
+    return max(0, y2 - y1) * max(0, x2 - x1)
+
+
+def _detection_position_score(element: dict[str, Any], detection: YoloDetection) -> float:
+    words = _normalized_words(_target_text(element))
+    y1, x1, y2, x2 = detection.bbox
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    area = _detection_area(detection)
+    score = detection.confidence * 1000.0
+    if words.intersection({"left", "leftmost"}):
+        score += 1000.0 - cx
+    if words.intersection({"right", "rightmost"}):
+        score += cx
+    if words.intersection({"top", "upper", "above"}):
+        score += 1000.0 - cy
+    if words.intersection({"bottom", "lower", "below"}):
+        score += cy
+    if words.intersection({"center", "centered", "central", "middle"}):
+        score += 1000.0 - abs(cx - 500.0) - abs(cy - 500.0)
+    if words.intersection({"large", "largest", "big", "biggest"}):
+        score += area / 1000.0
+    if words.intersection({"small", "smallest", "tiny"}):
+        score -= area / 1000.0
+    return score
+
+
+def yoloe_prompt_for_element(element: dict[str, Any], max_chars: int = 120) -> str:
+    if element.get("type") == "text":
+        visible_text = str(element.get("text", "")).strip()
+        if visible_text:
+            text = f'visible text "{visible_text}"'
+        else:
+            text = str(element.get("desc", "")).strip() or "visible text"
+    else:
+        text = str(element.get("desc", "")).strip() or "object"
+
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars].rsplit(" ", 1)[0].strip()
+    return truncated or text[:max_chars].strip()
+
+
+def yoloe_prompts_for_targets(
+    elements: list[dict[str, Any]],
+    indices: list[int],
+) -> tuple[list[str], dict[int, str]]:
+    prompts: list[str] = []
+    prompt_by_index: dict[int, str] = {}
+    seen: set[str] = set()
+    for index in indices:
+        prompt = yoloe_prompt_for_element(elements[index])
+        prompt_by_index[index] = prompt
+        key = _normalized_phrase(prompt)
+        if not key or key in seen:
+            continue
+        prompts.append(prompt)
+        seen.add(key)
+    return prompts, prompt_by_index
+
+
+def match_yoloe_detections_to_targets(
+    elements: list[dict[str, Any]],
+    indices: list[int],
+    detections: list[YoloDetection],
+    prompt_by_index: dict[int, str],
+) -> tuple[dict[int, list[int] | None], dict[int, str]]:
+    located: dict[int, list[int] | None] = {}
+    reasons: dict[int, str] = {}
+    used_detection_indices: set[int] = set()
+    detections_by_prompt: dict[str, list[YoloDetection]] = {}
+    for detection in detections:
+        detections_by_prompt.setdefault(_detection_class_key(detection), []).append(detection)
+
+    for index in indices:
+        prompt = prompt_by_index.get(index, "")
+        prompt_key = _normalized_phrase(prompt)
+        if not prompt_key:
+            located[index] = None
+            reasons[index] = "YOLOE-26 prompt unavailable"
+            continue
+
+        candidates = [
+            detection
+            for detection in detections_by_prompt.get(prompt_key, [])
+            if detection.index not in used_detection_indices
+        ]
+        if not candidates:
+            located[index] = None
+            reasons[index] = "YOLOE-26 detected no matching prompt"
+            continue
+
+        chosen = max(candidates, key=lambda detection: _detection_position_score(elements[index], detection))
+        located[index] = chosen.bbox
+        used_detection_indices.add(chosen.index)
+    return located, reasons
+
+
 def parse_batch_bboxes_with_reasons(
     raw: str,
     settings: CaptioningSettings | None = None,
@@ -1822,12 +2269,73 @@ def ordered_element_with_bbox(
     return out
 
 
+def add_yoloe_bboxes_to_caption(
+    settings: CaptioningSettings,
+    image_path: Path,
+    caption: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> tuple[dict[str, Any], int, int, dict[str, int]]:
+    data = normalize_caption(caption)
+    elements = data.get("compositional_deconstruction", {}).get("elements", [])
+    elements = [element for element in elements if isinstance(element, dict)]
+
+    to_locate, skipped_before = bbox_target_indices_with_reasons(elements, settings)
+    located: dict[int, list[int] | None] = {}
+    skipped_reasons: dict[int, str] = dict(skipped_before)
+    attempted = len(to_locate)
+
+    if to_locate:
+        prompts, prompt_by_index = yoloe_prompts_for_targets(elements, to_locate)
+        if not prompts:
+            for index in to_locate:
+                skipped_reasons[index] = "YOLOE-26 prompt unavailable"
+        else:
+            if progress:
+                progress(f"YOLOE-26 prompts: {len(prompts)} class(es).")
+            model_name = settings.yolo_bbox_model.strip() or DEFAULT_YOLOE26_BBOX_MODEL
+            detections, _class_names = yolo_detections_for_image(
+                settings,
+                image_path,
+                progress=progress,
+                class_prompts=prompts,
+                model_name=model_name,
+                label="YOLOE-26",
+            )
+            if progress:
+                progress(f"YOLOE-26 detections: {len(detections)} object(s).")
+            located, response_reasons = match_yoloe_detections_to_targets(
+                elements,
+                to_locate,
+                detections,
+                prompt_by_index,
+            )
+            skipped_reasons.update(response_reasons)
+
+    added = sum(1 for bbox in located.values() if bbox is not None)
+    new_elements = [
+        ordered_element_with_bbox(
+            element,
+            bbox=located.get(index),
+            keep_existing_if_no_new=not settings.overwrite_bboxes,
+        )
+        for index, element in enumerate(elements)
+    ]
+    data["compositional_deconstruction"]["elements"] = new_elements
+    reason_counts: dict[str, int] = {}
+    for reason in skipped_reasons.values():
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return normalize_caption(data), attempted, added, reason_counts
+
+
 def add_bboxes_to_caption(
     settings: CaptioningSettings,
     image_path: Path,
     caption: dict[str, Any],
     progress: ProgressCallback | None = None,
 ) -> tuple[dict[str, Any], int, int, dict[str, int]]:
+    if settings.bbox_backend == BBOX_BACKEND_YOLOE26:
+        return add_yoloe_bboxes_to_caption(settings, image_path, caption, progress=progress)
+
     data = normalize_caption(caption)
     elements = data.get("compositional_deconstruction", {}).get("elements", [])
     elements = [element for element in elements if isinstance(element, dict)]

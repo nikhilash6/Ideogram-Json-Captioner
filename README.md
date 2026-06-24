@@ -20,7 +20,7 @@ Ollama-compatible server.
   structured JSON captions.
 - Generate text captions, JSON captions from text, JSON captions from images,
   JSON refinements, and bounding boxes with a local or existing
-  vision-language model server.
+  vision-language model server or local Ultralytics detector.
 - Batch auto-caption selected images, retry failed captions, and undo the last
   auto-captioning job.
 - Sort and filter the image list by name, modified date, missing/blank JSON/text captions, or
@@ -105,7 +105,8 @@ The right-side `Auto Captioning` buttons do the following:
 - `Refine JSON`: revises existing structured JSON from the image, the current
   JSON, the text caption, and custom instructions entered at run
   time.
-- `Add/redo BBoxes`: localizes existing JSON elements with the selected VLM.
+- `Add/redo BBoxes`: localizes existing JSON elements with the selected bbox
+  backend.
 - `Retry Failed`: reruns images that have failed auto-captioning markers.
 - `Clear Failed`: removes failed markers without rerunning the model.
 - `Undo AI`: restores JSON/text captions from before the last auto-captioning job.
@@ -117,6 +118,19 @@ Image-based JSON operations automatically send a compact EXIF summary when the
 image has supported camera fields such as camera/lens model, f-stop, focal
 length, ISO, exposure time, exposure bias, metering, flash, or white balance.
 GPS and other broad metadata are not sent.
+
+The bbox backend can be changed in `Preferences` -> `Pipeline`:
+
+- `VLM grounding`: sends existing JSON elements to the selected bbox VLM and is
+  best for arbitrary detailed element descriptions.
+- `YOLOE-26 prompts`: runs Ultralytics locally, defaults to
+  `yoloe-26l-seg.pt`, and uses each JSON element description as an
+  open-vocabulary text prompt. This is better suited for specific items like
+  logos, clothing details, props, and uncommon objects.
+
+Ultralytics weights are downloaded by Ultralytics on first use. The
+`Ultralytics image size` preference defaults to `1024`; set it to `0` to use
+Ultralytics' own default, currently `640`.
 
 ## Failed Captions
 
@@ -193,8 +207,13 @@ system prompt automatically.
   or model profile.
 - JSON errors after generation: use the failed-caption filter and `Retry Failed`
   with a stronger model or larger context.
-- Missing bbox output: confirm the selected model profile supports vision and
-  bbox tasks, and that the model has access to its `mmproj` file if required.
+- Missing VLM bbox output: confirm the selected model profile supports vision
+  and bbox tasks, and that the model has access to its `mmproj` file if
+  required.
+- Missing YOLOE-26 bbox output: lower the Ultralytics confidence threshold,
+  increase `Ultralytics image size` for small objects, simplify overly long
+  element descriptions, or try the largest YOLOE-26 model,
+  `yoloe-26x-seg.pt`.
 - Local model download problems: verify the Hugging Face repo id, filename, and
   network access, or use a local profile with files already on disk.
 
