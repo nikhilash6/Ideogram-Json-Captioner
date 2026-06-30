@@ -3,9 +3,15 @@ import unittest
 from pathlib import Path
 
 from ideogram_captioner.gui import (
+    AI_IMAGE_STATE_ACTIVE,
+    AI_IMAGE_STATE_DONE,
     CAPTION_FILTER_BOTH,
     CAPTION_FILTER_JSON,
     CAPTION_FILTER_ORIGINAL,
+    IMAGE_LIST_AI_ACTIVE_BG,
+    IMAGE_LIST_AI_DONE_BG,
+    IMAGE_LIST_AI_QUEUED_BG,
+    IMAGE_LIST_BG,
     IMAGE_SORT_JSON_MISSING,
     IMAGE_SORT_TEXT_MISSING,
     CaptionEditorApp,
@@ -33,6 +39,7 @@ class FakeListbox:
         self.anchor: int | None = None
         self.xview: float | None = None
         self.yview_top = 0.0
+        self.configs: dict[int, dict[str, str]] = {}
 
     def curselection(self) -> tuple[int, ...]:
         return tuple(sorted(self.selection))
@@ -73,11 +80,22 @@ class FakeListbox:
     def selection_anchor(self, index: int) -> None:
         self.anchor = int(index)
 
+    def itemconfigure(self, index: int, **kwargs: str) -> None:
+        self.configs.setdefault(int(index), {}).update(kwargs)
+
 
 class FakeEvent:
     def __init__(self, y: int, state: int = 0) -> None:
         self.y = y
         self.state = state
+
+
+class FakeText:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def get(self, _start: str, _end: str) -> str:
+        return self.value
 
 
 class GuiSelectionTests(unittest.TestCase):
@@ -90,6 +108,7 @@ class GuiSelectionTests(unittest.TestCase):
         app.pending_image_select_job = None
         app.last_image_click_index = None
         app.image_selection_anchor_path = None
+        app.ai_image_states = {}
         app.after_idle = lambda callback: "job"
         app.after_cancel = lambda _job: None
         return app
@@ -146,6 +165,42 @@ class GuiSelectionTests(unittest.TestCase):
         app.restore_image_list_vertical_scroll(scroll)
 
         self.assertEqual(app.image_list.yview_top, 0.6)
+
+    def test_ai_image_state_colors_queue_active_done_and_clear(self) -> None:
+        app = self.make_app([Path("a.png"), Path("b.png"), Path("c.png")], (), 0)
+
+        app.set_ai_image_queue([Path("a.png"), Path("b.png"), Path("c.png")])
+        app.set_ai_image_state(Path("b.png"), AI_IMAGE_STATE_ACTIVE)
+        app.set_ai_image_state(Path("b.png"), AI_IMAGE_STATE_DONE)
+        app.set_ai_image_state(Path("c.png"), None)
+        app.finish_ai_image_states()
+
+        self.assertEqual(app.image_list.configs[0]["background"], IMAGE_LIST_BG)
+        self.assertEqual(app.image_list.configs[1]["background"], IMAGE_LIST_AI_DONE_BG)
+        self.assertEqual(app.image_list.configs[2]["background"], IMAGE_LIST_BG)
+
+        app.set_ai_image_state(Path("b.png"), AI_IMAGE_STATE_ACTIVE)
+
+        self.assertEqual(app.image_list.configs[0]["background"], IMAGE_LIST_BG)
+        self.assertEqual(app.image_list.configs[1]["background"], IMAGE_LIST_AI_ACTIVE_BG)
+
+        app.set_ai_image_queue([Path("a.png"), Path("c.png")])
+
+        self.assertEqual(app.image_list.configs[0]["background"], IMAGE_LIST_AI_QUEUED_BG)
+        self.assertEqual(app.image_list.configs[1]["background"], IMAGE_LIST_BG)
+        self.assertEqual(app.image_list.configs[2]["background"], IMAGE_LIST_AI_QUEUED_BG)
+
+    def test_ai_status_message_prefixes_current_filename(self) -> None:
+        event = {"message": "Checking caption assets...", "image_name": "sample.png"}
+
+        self.assertEqual(
+            CaptionEditorApp.ai_status_message(event),
+            "sample.png: Checking caption assets...",
+        )
+        self.assertEqual(
+            CaptionEditorApp.ai_status_message({"message": "sample.png: retrying previous failure.", "image_name": "sample.png"}),
+            "sample.png: retrying previous failure.",
+        )
 
     def test_shift_click_selects_range_from_saved_anchor(self) -> None:
         images = [Path("a.png"), Path("b.png"), Path("c.png"), Path("d.png"), Path("e.png")]
@@ -299,6 +354,50 @@ class GuiSelectionTests(unittest.TestCase):
             self.assertTrue(CaptionEditorApp.image_matches_style_filter(image, ".json", "", "photograph"))
             self.assertFalse(CaptionEditorApp.image_matches_style_filter(image, ".json", "art_style", "photograph"))
             self.assertFalse(CaptionEditorApp.image_matches_style_filter(image, ".json", "photo", "painting"))
+
+    def test_excel_tsv_row_quotes_cells_with_excel_delimiters(self) -> None:
+        self.assertEqual(
+            CaptionEditorApp.excel_tsv_row(['{"a":"b"}', 'caption with "quotes"\nand tab\tinside']),
+            '"{""a"":""b""}"\t"caption with ""quotes""\nand tab\tinside"',
+        )
+
+    def make_clipboard_app(self) -> CaptionEditorApp:
+        app = object.__new__(CaptionEditorApp)
+        app.images = [Path("sample.png")]
+        app.current_index = 0
+        app.current_caption = {"high_level_description": "json caption"}
+        app.original_text = FakeText('text caption with "quotes"')
+        app.status_var = FakeVar("")
+        app.sync_caption_from_form = lambda: None
+        app.clipboard_value = ""
+        app.clipboard_clear = lambda: setattr(app, "clipboard_value", "")
+        app.clipboard_append = lambda value: setattr(app, "clipboard_value", value)
+        return app
+
+    def test_copy_json_caption_to_clipboard(self) -> None:
+        app = self.make_clipboard_app()
+
+        app.copy_json_caption_to_clipboard()
+
+        self.assertIn('"high_level_description":"json caption"', app.clipboard_value)
+        self.assertEqual(app.status_var.get(), "Copied JSON caption to clipboard.")
+
+    def test_copy_text_caption_to_clipboard(self) -> None:
+        app = self.make_clipboard_app()
+
+        app.copy_text_caption_to_clipboard()
+
+        self.assertEqual(app.clipboard_value, 'text caption with "quotes"')
+        self.assertEqual(app.status_var.get(), "Copied text caption to clipboard.")
+
+    def test_copy_caption_pair_to_clipboard_uses_excel_ready_columns(self) -> None:
+        app = self.make_clipboard_app()
+
+        app.copy_caption_pair_to_clipboard()
+
+        self.assertIn("\t", app.clipboard_value)
+        self.assertTrue(app.clipboard_value.startswith('"text caption with ""quotes"""\t'))
+        self.assertEqual(app.status_var.get(), "Copied text and JSON captions for Excel.")
 
 
 if __name__ == "__main__":

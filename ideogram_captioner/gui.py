@@ -27,6 +27,7 @@ from .schema import (
     normalize_caption,
     parse_palette_text,
     palette_to_text,
+    serialize_caption,
 )
 from .store import CaptionStore
 from .llm_captioning import (
@@ -102,6 +103,25 @@ ELEMENT_ROW_BASE_COLOR = "#1f2430"
 ELEMENT_ROW_TEXT_COLOR = "#f8fbff"
 ELEMENT_ROW_TEXT_TEXT_COLOR = "#fff2df"
 ELEMENT_ROW_TINT = 0.22
+IMAGE_LIST_BG = "#1f2430"
+IMAGE_LIST_FG = "#e8edf7"
+IMAGE_LIST_SELECT_BG = "#315fbd"
+IMAGE_LIST_SELECT_FG = "#ffffff"
+AI_IMAGE_STATE_QUEUED = "queued"
+AI_IMAGE_STATE_ACTIVE = "active"
+AI_IMAGE_STATE_DONE = "done"
+IMAGE_LIST_AI_QUEUED_BG = "#8a3f00"
+IMAGE_LIST_AI_QUEUED_FG = "#fff6e8"
+IMAGE_LIST_AI_QUEUED_SELECT_BG = "#b35400"
+IMAGE_LIST_AI_QUEUED_SELECT_FG = "#ffffff"
+IMAGE_LIST_AI_ACTIVE_BG = "#123f75"
+IMAGE_LIST_AI_ACTIVE_FG = "#eef6ff"
+IMAGE_LIST_AI_ACTIVE_SELECT_BG = "#1f5fa8"
+IMAGE_LIST_AI_ACTIVE_SELECT_FG = "#ffffff"
+IMAGE_LIST_AI_DONE_BG = "#145c2e"
+IMAGE_LIST_AI_DONE_FG = "#f2fff7"
+IMAGE_LIST_AI_DONE_SELECT_BG = "#1f7a3d"
+IMAGE_LIST_AI_DONE_SELECT_FG = "#ffffff"
 CONTROL_MASK = 0x0004
 ORIGINAL_NONE = "none"
 ORIGINAL_FILE_EXTENSIONS = (".txt", ".original", ORIGINAL_NONE)
@@ -844,6 +864,7 @@ class CaptionEditorApp(tk.Tk):
         self.ai_buttons: list[ttk.Button] = []
         self.ai_cancel_button: ttk.Button | None = None
         self.ai_cancel_event: threading.Event | None = None
+        self.ai_image_states: dict[Path, str] = {}
         self.ai_server_process: subprocess.Popen | None = None
         self.ai_server_command: str | None = None
         self.ai_server_phase: str | None = None
@@ -949,7 +970,7 @@ class CaptionEditorApp(tk.Tk):
 
         toolbar = ttk.Frame(self, style="Toolbar.TFrame", padding=(8, 6))
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(10, weight=1)
+        toolbar.columnconfigure(12, weight=1)
 
         ttk.Button(toolbar, text="Open Folder", command=self.open_folder_dialog).grid(row=0, column=0, padx=(0, 8))
         ttk.Label(toolbar, text="JSON caption", style="Status.TLabel").grid(row=0, column=1, padx=(0, 6))
@@ -971,11 +992,19 @@ class CaptionEditorApp(tk.Tk):
         )
         self.original_extension_combo.grid(row=0, column=4, padx=(0, 8))
         ttk.Button(toolbar, text="Save", command=self.save_current, style="Accent.TButton").grid(row=0, column=5, padx=(0, 8))
-        ttk.Button(toolbar, text="Copy to edit", command=self.copy_current_image_to_edit).grid(row=0, column=6, padx=(0, 8))
-        ttk.Button(toolbar, text="Previous", command=self.previous_image).grid(row=0, column=7, padx=(0, 4))
-        ttk.Button(toolbar, text="Next", command=self.next_image).grid(row=0, column=8, padx=(0, 8))
-        ttk.Button(toolbar, text="Preferences", command=self.open_captioning_preferences).grid(row=0, column=9, padx=(0, 8))
-        ttk.Label(toolbar, textvariable=self.status_var, style="Status.TLabel", anchor="e").grid(row=0, column=10, sticky="ew")
+        ttk.Button(toolbar, text="Copy", command=self.copy_caption_pair_to_clipboard).grid(row=0, column=6, padx=(0, 2))
+        self.copy_menu_button = ttk.Menubutton(toolbar, text="v", width=2)
+        self.copy_menu = tk.Menu(self.copy_menu_button, tearoff=False)
+        self.copy_menu.add_command(label="Both for Excel", command=self.copy_caption_pair_to_clipboard)
+        self.copy_menu.add_command(label="JSON caption", command=self.copy_json_caption_to_clipboard)
+        self.copy_menu.add_command(label="Text caption", command=self.copy_text_caption_to_clipboard)
+        self.copy_menu_button["menu"] = self.copy_menu
+        self.copy_menu_button.grid(row=0, column=7, padx=(0, 8))
+        ttk.Button(toolbar, text="Copy to edit", command=self.copy_current_image_to_edit).grid(row=0, column=8, padx=(0, 8))
+        ttk.Button(toolbar, text="Previous", command=self.previous_image).grid(row=0, column=9, padx=(0, 4))
+        ttk.Button(toolbar, text="Next", command=self.next_image).grid(row=0, column=10, padx=(0, 8))
+        ttk.Button(toolbar, text="Preferences", command=self.open_captioning_preferences).grid(row=0, column=11, padx=(0, 8))
+        ttk.Label(toolbar, textvariable=self.status_var, style="Status.TLabel", anchor="e").grid(row=0, column=12, sticky="ew")
 
         self.ai_progress_frame = ttk.Frame(self, style="Toolbar.TFrame", padding=(8, 0, 8, 6))
         self.ai_progress_frame.grid(row=1, column=0, sticky="ew")
@@ -1055,10 +1084,10 @@ class CaptionEditorApp(tk.Tk):
             list_frame,
             width=24,
             activestyle="dotbox",
-            bg="#1f2430",
-            fg="#e8edf7",
-            selectbackground="#315fbd",
-            selectforeground="#ffffff",
+            bg=IMAGE_LIST_BG,
+            fg=IMAGE_LIST_FG,
+            selectbackground=IMAGE_LIST_SELECT_BG,
+            selectforeground=IMAGE_LIST_SELECT_FG,
             highlightthickness=0,
             relief="flat",
             exportselection=False,
@@ -2139,6 +2168,7 @@ class CaptionEditorApp(tk.Tk):
         self.folder = folder
         self.store = CaptionStore(folder, self.caption_extension_var.get())
         self.reset_caption_filter_state()
+        self.ai_image_states.clear()
         self.all_images = self.store.images()
         self.images = []
         self.current_index = -1
@@ -2338,6 +2368,89 @@ class CaptionEditorApp(tk.Tk):
         except tk.TclError:
             pass
 
+    def image_list_item_style(self, image_path: Path) -> dict[str, str]:
+        state = self.ai_image_states.get(image_path)
+        if state == AI_IMAGE_STATE_ACTIVE:
+            return {
+                "background": IMAGE_LIST_AI_ACTIVE_BG,
+                "foreground": IMAGE_LIST_AI_ACTIVE_FG,
+                "selectbackground": IMAGE_LIST_AI_ACTIVE_SELECT_BG,
+                "selectforeground": IMAGE_LIST_AI_ACTIVE_SELECT_FG,
+            }
+        if state == AI_IMAGE_STATE_QUEUED:
+            return {
+                "background": IMAGE_LIST_AI_QUEUED_BG,
+                "foreground": IMAGE_LIST_AI_QUEUED_FG,
+                "selectbackground": IMAGE_LIST_AI_QUEUED_SELECT_BG,
+                "selectforeground": IMAGE_LIST_AI_QUEUED_SELECT_FG,
+            }
+        if state == AI_IMAGE_STATE_DONE:
+            return {
+                "background": IMAGE_LIST_AI_DONE_BG,
+                "foreground": IMAGE_LIST_AI_DONE_FG,
+                "selectbackground": IMAGE_LIST_AI_DONE_SELECT_BG,
+                "selectforeground": IMAGE_LIST_AI_DONE_SELECT_FG,
+            }
+        return {
+            "background": IMAGE_LIST_BG,
+            "foreground": IMAGE_LIST_FG,
+            "selectbackground": IMAGE_LIST_SELECT_BG,
+            "selectforeground": IMAGE_LIST_SELECT_FG,
+        }
+
+    def configure_image_list_item(self, index: int, image_path: Path) -> None:
+        options = self.image_list_item_style(image_path)
+        try:
+            self.image_list.itemconfigure(
+                index,
+                background=options["background"],
+                foreground=options["foreground"],
+            )
+            self.image_list.itemconfigure(
+                index,
+                selectbackground=options["selectbackground"],
+                selectforeground=options["selectforeground"],
+            )
+        except tk.TclError:
+            pass
+
+    def refresh_ai_image_state_rows(self, image_paths: set[Path] | list[Path] | tuple[Path, ...]) -> None:
+        for path in dict.fromkeys(image_paths):
+            try:
+                index = self.images.index(path)
+            except ValueError:
+                continue
+            self.configure_image_list_item(index, path)
+
+    def set_ai_image_state(self, image_path: Path | str | None, state: str | None) -> None:
+        if not image_path:
+            return
+        path = Path(image_path)
+        previous_state = self.ai_image_states.get(path)
+        if state is None:
+            if path not in self.ai_image_states:
+                return
+            self.ai_image_states.pop(path, None)
+        else:
+            if previous_state == state:
+                return
+            self.ai_image_states[path] = state
+        self.refresh_ai_image_state_rows([path])
+
+    def set_ai_image_queue(self, image_paths: list[Path]) -> None:
+        previous_paths = set(self.ai_image_states)
+        self.ai_image_states = {Path(image_path): AI_IMAGE_STATE_QUEUED for image_path in image_paths}
+        self.refresh_ai_image_state_rows(previous_paths | set(self.ai_image_states))
+
+    def finish_ai_image_states(self) -> None:
+        previous_paths = set(self.ai_image_states)
+        self.ai_image_states = {
+            image_path: state
+            for image_path, state in self.ai_image_states.items()
+            if state == AI_IMAGE_STATE_DONE
+        }
+        self.refresh_ai_image_state_rows(previous_paths | set(self.ai_image_states))
+
     def populate_image_list(self, preserve_scroll: bool = False) -> None:
         scroll = self.image_list_vertical_scroll() if preserve_scroll else None
         self.loading_list = True
@@ -2352,6 +2465,7 @@ class CaptionEditorApp(tk.Tk):
             else:
                 marker = " " if self.store.caption_path(image_path).exists() else "+"
             self.image_list.insert("end", f"{index:04d} {marker} {image_path.name}")
+            self.configure_image_list_item(index - 1, image_path)
         self.reset_image_list_horizontal_scroll()
         self.restore_image_list_vertical_scroll(scroll)
         self.loading_list = False
@@ -3050,6 +3164,14 @@ class CaptionEditorApp(tk.Tk):
         self.ai_progress_text_var.set(f"{label}: {current}/{total}")
         self.ai_progress_frame.grid()
 
+    @staticmethod
+    def ai_status_message(event: dict[str, Any]) -> str:
+        message = str(event.get("message", ""))
+        image_name = str(event.get("image_name", "")).strip()
+        if image_name and image_name not in message:
+            return f"{image_name}: {message}"
+        return message
+
     def selected_image_paths_for_ai(self) -> list[Path]:
         if not self.images:
             return []
@@ -3175,6 +3297,7 @@ class CaptionEditorApp(tk.Tk):
         self.ai_cancel_event = threading.Event()
 
         self.set_ai_controls_running(True)
+        self.set_ai_image_queue([target["image_path"] for target in targets])
         self.show_ai_progress(label, len(targets))
         self.status_var.set(f"Starting {label} for {len(targets)} image(s)...")
         self.ai_worker = threading.Thread(
@@ -3220,18 +3343,28 @@ class CaptionEditorApp(tk.Tk):
         bbox_reason_totals: dict[str, int] = {}
         errors: list[str] = []
         canceled = False
+        active_image_path: Path | None = None
 
         class AiJobCanceled(Exception):
             pass
 
         def progress(message: str | None = None, current: int | None = None, total: int | None = None) -> None:
             event: dict[str, Any] = {"type": "progress", "label": label}
+            if active_image_path is not None:
+                event["image_path"] = str(active_image_path)
+                event["image_name"] = active_image_path.name
             if message is not None:
                 event["message"] = message
             if current is not None:
                 event["current"] = current
             if total is not None:
                 event["total"] = total
+            self.ai_queue.put(event)
+
+        def image_state(image_path: Path, state: str | None) -> None:
+            event: dict[str, Any] = {"type": "image_state", "image_path": str(image_path)}
+            if state is not None:
+                event["state"] = state
             self.ai_queue.put(event)
 
         def ensure_endpoint_exposes_model(config_label: str, api_model: str) -> None:
@@ -3392,10 +3525,12 @@ class CaptionEditorApp(tk.Tk):
         try:
             for index, target in enumerate(targets, start=1):
                 if cancel_event.is_set():
+                    active_image_path = None
                     canceled = True
                     progress(f"Canceled {label} after {ok + failed}/{len(targets)} image(s).", current=ok + failed, total=len(targets))
                     break
                 image_path = target["image_path"]
+                active_image_path = image_path
                 effective_operation = retry_operation_for_marker(image_path) if operation == "retry_failed" else operation
                 failure_task = "caption"
                 item_changed = False
@@ -3489,9 +3624,12 @@ class CaptionEditorApp(tk.Tk):
                     ok += 1
                     if item_changed:
                         changed += 1
+                    image_state(image_path, AI_IMAGE_STATE_DONE)
                 except AiJobCanceled:
                     canceled = True
                     progress(f"Canceled {label} after {ok + failed}/{len(targets)} image(s).", current=ok + failed, total=len(targets))
+                    image_state(image_path, None)
+                    active_image_path = None
                     break
                 except Exception as exc:
                     failed += 1
@@ -3506,10 +3644,13 @@ class CaptionEditorApp(tk.Tk):
                         error += f" (also could not write failure marker: {marker_exc})"
                     errors.append(error)
                     progress(error)
+                    image_state(image_path, None)
                     if item_changed:
                         changed += 1
+                active_image_path = None
                 progress(current=index, total=len(targets))
         finally:
+            active_image_path = None
             if settings.stop_server_after_job and managed_process is not None:
                 progress("Stopping auto-started server...")
                 stop_server_process(managed_process)
@@ -3546,15 +3687,21 @@ class CaptionEditorApp(tk.Tk):
                 break
 
             if event.get("type") == "progress":
+                if "image_path" in event:
+                    self.set_ai_image_state(event.get("image_path"), AI_IMAGE_STATE_ACTIVE)
                 if "message" in event:
-                    self.status_var.set(str(event.get("message", "")))
+                    self.status_var.set(self.ai_status_message(event))
                 if "current" in event and "total" in event:
                     self.update_ai_progress(
                         str(event.get("label", "Auto-captioning")),
                         int(event.get("current", 0)),
                         int(event.get("total", 1)),
                     )
+            elif event.get("type") == "image_state":
+                raw_state = event.get("state")
+                self.set_ai_image_state(event.get("image_path"), str(raw_state) if raw_state else None)
             elif event.get("type") == "done":
+                self.finish_ai_image_states()
                 self.ai_server_process = event.get("server_process")
                 self.ai_server_command = event.get("server_command")
                 self.ai_server_phase = event.get("server_phase")
@@ -3596,6 +3743,7 @@ class CaptionEditorApp(tk.Tk):
             self.after(100, self.poll_ai_queue)
             return
 
+        self.finish_ai_image_states()
         self.set_ai_controls_running(False)
         if final_message:
             self.refresh_after_ai_job(final_message)
@@ -3726,6 +3874,58 @@ class CaptionEditorApp(tk.Tk):
         self.restore_image_list_vertical_scroll(list_scroll)
         self.status_var.set(saved_message)
         return False
+
+    @staticmethod
+    def excel_tsv_cell(value: str) -> str:
+        if any(char in value for char in ('"', "\t", "\r", "\n")):
+            return '"' + value.replace('"', '""') + '"'
+        return value
+
+    @classmethod
+    def excel_tsv_row(cls, values: list[str]) -> str:
+        return "\t".join(cls.excel_tsv_cell(value) for value in values)
+
+    def current_clipboard_captions(self) -> tuple[str, str] | None:
+        if self.current_index < 0 or self.current_index >= len(self.images):
+            self.status_var.set("Select an image to copy captions.")
+            return None
+        self.sync_caption_from_form()
+        json_caption = serialize_caption(self.current_caption)
+        text_caption = self._get_text(self.original_text)
+        return json_caption, text_caption
+
+    def copy_text_to_clipboard(self, text: str, status: str) -> None:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError as exc:
+            messagebox.showerror("Copy failed", str(exc))
+            return
+        self.status_var.set(status)
+
+    def copy_json_caption_to_clipboard(self) -> None:
+        captions = self.current_clipboard_captions()
+        if captions is None:
+            return
+        json_caption, _text_caption = captions
+        self.copy_text_to_clipboard(json_caption, "Copied JSON caption to clipboard.")
+
+    def copy_text_caption_to_clipboard(self) -> None:
+        captions = self.current_clipboard_captions()
+        if captions is None:
+            return
+        _json_caption, text_caption = captions
+        self.copy_text_to_clipboard(text_caption, "Copied text caption to clipboard.")
+
+    def copy_caption_pair_to_clipboard(self) -> None:
+        captions = self.current_clipboard_captions()
+        if captions is None:
+            return
+        json_caption, text_caption = captions
+        self.copy_text_to_clipboard(
+            self.excel_tsv_row([text_caption, json_caption]),
+            "Copied text and JSON captions for Excel.",
+        )
 
     def copy_current_image_to_edit(self) -> None:
         if self.current_index < 0 or self.current_index >= len(self.images):
