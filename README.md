@@ -1,10 +1,10 @@
 # Ideogram JSON Captioner
 
-A local desktop editor for image-caption pairs in Ideogram 4 structured JSON
-format. Use it to generate either regular captions or JSON captions, review image datasets, repair generated captions, edit source
+A local desktop editor and generator for image-caption pairs in Ideogram 4 structured JSON
+format or regular text captions. Use it to generate either regular captions or JSON captions, review image datasets, repair generated captions, edit source
 caption text, and draw or adjust object/text bounding boxes.  You can also generate JSON captions based on your already existing and vetted captions.
 
-The app runs locally by default. . Auto-captioning sends requests only to the OpenAI-compatible endpoint
+The app runs locally by default. Auto-captioning sends requests only to the OpenAI-compatible endpoint
 you configure in Preferences, such as a local llama.cpp, LM Studio, vLLM, or
 Ollama-compatible server.
 
@@ -59,11 +59,7 @@ python run_captioner.py
 4. Select an image, edit the fields, then use `Save` or `Enter` to save and move
    to the next image.
 
-When the selected JSON sidecar is missing, the app also checks image metadata
-for embedded caption JSON before starting from a blank caption. Existing
-sidecar files always take priority. This supports PNG text metadata and EXIF
-fields that contain either a direct Ideogram JSON caption or ComfyUI prompt
-metadata with caption JSON in text nodes.
+The app will also load metadata from ComfyUI files as either Ideogram JSON format or regular text captions.
    
 ### Automatic Captioning: 
 If you don't already have an OpenAI-compatible server, the easiest way to get automatic captioning working is to grab llama.cpp from their releases section - https://github.com/ggml-org/llama.cpp/releases - and be sure to grab the CUDA .dlls and put them in the same folder as llama-server.exe if you're using an Nvidia card, otherwise it will probably be quite slow.
@@ -131,9 +127,8 @@ The bbox backend can be changed in `Preferences` -> `Pipeline`:
   best for arbitrary detailed element descriptions.
 - `YOLOE-26 prompts`: runs Ultralytics locally, defaults to
   `yoloe-26l-seg.pt`, and uses each JSON element description as an
-  open-vocabulary text prompt. This is better suited for specific items like
-  logos, clothing details, props, and uncommon objects.
-
+  open-vocabulary text prompt. 
+  
 Ultralytics weights are downloaded by Ultralytics on first use. The
 `Ultralytics image size` preference defaults to `1024`; set it to `0` to use
 Ultralytics' own default, currently `640`.

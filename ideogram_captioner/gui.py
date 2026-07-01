@@ -17,6 +17,7 @@ from typing import Any
 
 from PIL import Image, ImageTk, UnidentifiedImageError
 
+from .exif_caption import try_import_prompt_text_from_exif
 from .schema import (
     CAPTION_EXTENSIONS,
     COMMON_MEDIA,
@@ -1702,7 +1703,7 @@ class CaptionEditorApp(tk.Tk):
         self.update_original_text_state()
         self.loading_original = False
 
-    def load_original_text(self, image_path: Path) -> None:
+    def load_original_text(self, image_path: Path, import_from_metadata: bool = True) -> None:
         original_path = self.original_path_for_image(image_path)
         if original_path is None:
             self.clear_original_text("Text caption: none")
@@ -1720,12 +1721,19 @@ class CaptionEditorApp(tk.Tk):
             self.original_status_var.set(f"Text caption: could not read {original_path.name}: {exc}")
             self.current_original_path = None
         else:
-            if original_path.exists():
+            imported_message = None
+            if import_from_metadata and not text.strip():
+                imported_text, imported_message = try_import_prompt_text_from_exif(image_path)
+                if imported_text is not None:
+                    text = imported_text
+            if imported_message:
+                self.original_status_var.set(imported_message)
+            elif original_path.exists():
                 self.original_status_var.set(f"Text caption: {original_path.name}")
             else:
                 self.original_status_var.set(f"Text caption: no {original_path.name} yet")
         self._set_text(self.original_text, text)
-        self.original_dirty = False
+        self.original_dirty = bool("imported_message" in locals() and imported_message)
         self.update_original_text_state()
         self.loading_original = False
 
@@ -2671,7 +2679,8 @@ class CaptionEditorApp(tk.Tk):
 
         elements = self.current_caption["compositional_deconstruction"]["elements"]
         self.selected_element_index = 0 if elements else None
-        self.load_original_text(image_path)
+        import_original_from_metadata = not (message and message.startswith("Imported "))
+        self.load_original_text(image_path, import_from_metadata=import_original_from_metadata)
         self.populate_form()
         self.populate_image_selection(
             selected_paths=selected_paths if preserve_selection else None,
@@ -2680,6 +2689,8 @@ class CaptionEditorApp(tk.Tk):
         if reset_editor_scroll:
             self.editor.scroll_to_top()
         self.render_image()
+        if message and message.startswith("Imported "):
+            self.dirty = True
         if message:
             self.status_var.set(message)
         else:

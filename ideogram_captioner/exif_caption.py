@@ -40,6 +40,7 @@ _UTILITY_CLASSES = {
     "customcombo",
 }
 _CAPTION_KEYS = {"high_level_description", "style_description", "compositional_deconstruction"}
+_PROMPT_BUILDER_CLASSES = {"ideogram4promptbuilderkj", "ideogram4promptbuilder"}
 
 
 def _decode_text(value: Any) -> str | None:
@@ -190,6 +191,96 @@ def _extract_comfy_nodes(prompt: dict[str, Any]) -> list[tuple[str, str]]:
     return [*_node_texts_from_api_prompt(prompt), *_node_texts_from_ui_workflow(prompt)]
 
 
+def _caption_from_prompt_builder(node: dict[str, Any]) -> dict[str, Any] | None:
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+
+    elements: list[dict[str, Any]] = []
+    elements_raw = inputs.get("elements_data")
+    if isinstance(elements_raw, str) and elements_raw.strip():
+        try:
+            parsed_elements = json.loads(elements_raw)
+        except json.JSONDecodeError:
+            parsed_elements = []
+        if isinstance(parsed_elements, list):
+            for item in parsed_elements:
+                if not isinstance(item, dict):
+                    continue
+                element: dict[str, Any] = {"type": "text" if item.get("type") == "text" else "obj"}
+                try:
+                    x = float(item.get("x", 0))
+                    y = float(item.get("y", 0))
+                    w = float(item.get("w", 0))
+                    h = float(item.get("h", 0))
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    element["bbox"] = [
+                        round(y * 1000),
+                        round(x * 1000),
+                        round((y + h) * 1000),
+                        round((x + w) * 1000),
+                    ]
+                if element["type"] == "text":
+                    element["text"] = str(item.get("text", "") or "")
+                element["desc"] = str(item.get("desc", "") or "")
+                palette = item.get("palette")
+                if isinstance(palette, list):
+                    element["color_palette"] = palette
+                elements.append(element)
+
+    mode = str(inputs.get("style", "photo") or "photo").strip()
+    style: dict[str, Any] = {
+        "aesthetics": str(inputs.get("aesthetics", "") or ""),
+        "lighting": str(inputs.get("lighting", "") or ""),
+        "medium": str(inputs.get("medium", "") or ("photograph" if mode == "photo" else "illustration")),
+    }
+    if mode == "photo":
+        style["photo"] = str(inputs.get("style.photo", inputs.get("photo", "")) or "")
+    else:
+        style["art_style"] = str(inputs.get("style.art_style", inputs.get("art_style", "")) or "")
+
+    palette_raw = inputs.get("style_palette_data")
+    if isinstance(palette_raw, str) and palette_raw.strip():
+        try:
+            style["color_palette"] = json.loads(palette_raw)
+        except json.JSONDecodeError:
+            pass
+
+    caption = {
+        "high_level_description": str(inputs.get("high_level_description", "") or ""),
+        "style_description": style,
+        "compositional_deconstruction": {
+            "background": str(inputs.get("background", "") or ""),
+            "elements": elements,
+        },
+    }
+    normalized = normalize_caption(caption)
+    if (
+        normalized["high_level_description"].strip()
+        or normalized["compositional_deconstruction"]["background"].strip()
+        or normalized["compositional_deconstruction"]["elements"]
+    ):
+        return normalized
+    return None
+
+
+def _caption_from_comfy_prompt(prompt: dict[str, Any]) -> dict[str, Any] | None:
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type", "") or "")
+        title = str((node.get("_meta") or {}).get("title", "") or "")
+        class_key = class_type.lower().replace(" ", "")
+        title_key = title.lower().replace(" ", "")
+        if class_key in _PROMPT_BUILDER_CLASSES or title_key in _PROMPT_BUILDER_CLASSES:
+            caption = _caption_from_prompt_builder(node)
+            if caption is not None:
+                return caption
+    return None
+
+
 def extract_workflow_text_nodes(path: str | Path) -> list[tuple[str, str]]:
     """Return (node_name, text) pairs discovered in embedded ComfyUI metadata."""
     try:
@@ -256,7 +347,20 @@ def _try_parse_caption_json(text: str) -> dict[str, Any] | None:
 
 
 def try_import_caption_from_exif(path: str | Path) -> tuple[dict[str, Any] | None, str | None]:
-    """Try to import caption JSON from image metadata."""
+    """Try to import structured caption data from image metadata."""
+    try:
+        fields = _collect_raw_fields(path)
+    except Exception:
+        fields = {}
+
+    for value in fields.values():
+        prompt = _load_comfy_prompt(value)
+        if not prompt:
+            continue
+        caption = _caption_from_comfy_prompt(prompt)
+        if caption is not None:
+            return caption, "Imported Ideogram caption fields from image metadata; click Save to persist."
+
     candidates: list[str] = []
     seen: set[str] = set()
     for text in [*workflow_text_candidates(path), *_metadata_text_candidates(path)]:
@@ -268,4 +372,18 @@ def try_import_caption_from_exif(path: str | Path) -> tuple[dict[str, Any] | Non
         caption = _try_parse_caption_json(text)
         if caption is not None:
             return caption, "Imported caption JSON from image metadata; click Save to persist."
+    return None, None
+
+
+def _looks_like_json_text(text: str) -> bool:
+    text = text.strip()
+    return bool(text) and (text[0] in "[{" or text.startswith("```"))
+
+
+def try_import_prompt_text_from_exif(path: str | Path) -> tuple[str | None, str | None]:
+    """Try to import plain ComfyUI prompt text from image metadata."""
+    for text in workflow_text_candidates(path):
+        text = text.strip()
+        if len(text) >= _MIN_TEXT_LEN and not _looks_like_json_text(text):
+            return text, "Imported prompt text from image metadata; click Save to persist as text caption."
     return None, None

@@ -5,7 +5,11 @@ from pathlib import Path
 
 from PIL import Image, PngImagePlugin
 
-from ideogram_captioner.exif_caption import try_import_caption_from_exif, workflow_text_candidates
+from ideogram_captioner.exif_caption import (
+    try_import_caption_from_exif,
+    try_import_prompt_text_from_exif,
+    workflow_text_candidates,
+)
 from ideogram_captioner.schema import normalize_caption
 from ideogram_captioner.store import CaptionStore
 
@@ -70,6 +74,42 @@ def _save_png_with_comfy_workflow(path: Path, node_texts: list[str]) -> None:
     image = Image.new("RGB", (8, 8), color="white")
     metadata = PngImagePlugin.PngInfo()
     metadata.add_text("workflow", json.dumps(workflow))
+    image.save(path, pnginfo=metadata)
+
+
+def _save_png_with_ideogram_prompt_builder(path: Path) -> None:
+    prompt = {
+        "211": {
+            "class_type": "Ideogram4PromptBuilderKJ",
+            "inputs": {
+                "high_level_description": "A photograph of Tara Glenz, standing outside.",
+                "background": "outside, trees in the background",
+                "style": "photo",
+                "style.photo": "85mm",
+                "aesthetics": "",
+                "lighting": "diffused daylight",
+                "medium": "photograph",
+                "elements_data": json.dumps(
+                    [
+                        {
+                            "x": 0.17153097989241708,
+                            "y": 0.021125327888722192,
+                            "w": 0.6658940219757437,
+                            "h": 0.9788746721112778,
+                            "type": "obj",
+                            "text": "",
+                            "desc": "Tara Glenz, looking at the camera.",
+                            "palette": [],
+                        }
+                    ]
+                ),
+            },
+            "_meta": {"title": "Ideogram 4 Prompt Builder KJ"},
+        }
+    }
+    image = Image.new("RGB", (8, 8), color="white")
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("prompt", json.dumps(prompt))
     image.save(path, pnginfo=metadata)
 
 
@@ -156,15 +196,56 @@ class ExifCaptionTests(unittest.TestCase):
             self.assertIn("Imported caption JSON", message or "")
             self.assertEqual(caption["high_level_description"], "Sign")
 
-    def test_ignores_workflow_without_caption_json(self):
+    def test_imports_ideogram_prompt_builder_as_structured_caption(self):
         with tempfile.TemporaryDirectory() as temp:
             image_path = Path(temp) / "sample.png"
-            _save_png_with_comfy_prompt(image_path, [json.dumps({"not_a_caption": {"x": 1}})])
+            _save_png_with_ideogram_prompt_builder(image_path)
 
             caption, message = try_import_caption_from_exif(image_path)
 
+            self.assertIsNotNone(caption)
+            self.assertIn("Imported Ideogram caption fields", message or "")
+            self.assertEqual(caption["high_level_description"], "A photograph of Tara Glenz, standing outside.")
+            self.assertEqual(caption["style_description"]["photo"], "85mm")
+            self.assertEqual(caption["compositional_deconstruction"]["background"], "outside, trees in the background")
+            self.assertEqual(
+                caption["compositional_deconstruction"]["elements"][0],
+                {
+                    "type": "obj",
+                    "bbox": [21, 172, 1000, 837],
+                    "desc": "Tara Glenz, looking at the camera.",
+                },
+            )
+
+    def test_imports_longest_workflow_prompt_as_plain_text_when_no_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "sample.png"
+            prompt = (
+                "Tara Glenz, wearing the Mighty Morphin Power Ranger Pink Ranger's outfit. "
+                "Tara Glenz is inside the Pterodactyl Zord cockpit, and her face is visible."
+            )
+            _save_png_with_comfy_prompt(image_path, [prompt, "helmet"])
+
+            caption, caption_message = try_import_caption_from_exif(image_path)
+            text, text_message = try_import_prompt_text_from_exif(image_path)
+
+            self.assertIsNone(caption)
+            self.assertIsNone(caption_message)
+            self.assertIn("Imported prompt text", text_message or "")
+            self.assertEqual(text, prompt)
+
+    def test_ignores_workflow_without_caption_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "sample.png"
+            _save_png_with_comfy_prompt(image_path, ["short"])
+
+            caption, message = try_import_caption_from_exif(image_path)
+            text, text_message = try_import_prompt_text_from_exif(image_path)
+
             self.assertIsNone(caption)
             self.assertIsNone(message)
+            self.assertIsNone(text)
+            self.assertIsNone(text_message)
 
 
 class StoreExifImportTests(unittest.TestCase):
