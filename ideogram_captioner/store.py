@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .exif_caption import try_import_caption_from_exif
 from .schema import IMAGE_EXTENSIONS, caption_from_plain_text, default_caption, parse_caption_text, serialize_caption
 
 
@@ -54,6 +55,9 @@ class CaptionStore:
     def load_caption(self, image_path: Path) -> tuple[dict[str, Any], str | None]:
         caption_path = self.caption_path(image_path)
         if not caption_path.exists():
+            caption, message = try_import_caption_from_exif(image_path)
+            if caption is not None:
+                return caption, message
             return default_caption(), f"No {self.extension} JSON caption yet; edit fields or click Save to create it."
 
         raw = caption_path.read_text(encoding="utf-8-sig")

@@ -58,6 +58,12 @@ python run_captioner.py
    such as `.txt` or `.original`.
 4. Select an image, edit the fields, then use `Save` or `Enter` to save and move
    to the next image.
+
+When the selected JSON sidecar is missing, the app also checks image metadata
+for embedded caption JSON before starting from a blank caption. Existing
+sidecar files always take priority. This supports PNG text metadata and EXIF
+fields that contain either a direct Ideogram JSON caption or ComfyUI prompt
+metadata with caption JSON in text nodes.
    
 ### Automatic Captioning: 
 If you don't already have an OpenAI-compatible server, the easiest way to get automatic captioning working is to grab llama.cpp from their releases section - https://github.com/ggml-org/llama.cpp/releases - and be sure to grab the CUDA .dlls and put them in the same folder as llama-server.exe if you're using an Nvidia card, otherwise it will probably be quite slow.
